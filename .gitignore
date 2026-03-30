@@ -1,0 +1,120 @@
+# Build directories
+build/
+cmake-build-*/
+out/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.cproject
+.settings/
+
+# Compiled files
+*.o
+*.obj
+*.exe
+*.out
+*.app
+*.so
+*.dylib
+*.dll
+*.a
+*.lib
+
+# CMake files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+
+# Test and benchmark outputs
+test_data/
+benchmark_results/
+*.log
+
+# Data files (large datasets)
+data/sift1m/
+data/sift1b/
+*.fvecs
+*.ivecs
+*.bvecs
+*.bin
+
+# Index files
+index/
+*.index
+*.graph
+*.vec
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# Documentation
+docs/_build/
+site/
+
+# Coverage reports
+coverage/
+*.gcda
+*.gcno
+*.gcov
+
+# Profiling
+*.prof
+gmon.out
+perf.data
+perf.data.old
+
+# Package managers
+node_modules/
+.npm
+.pnpm-debug.log
+
+# Configuration
+.env
+.env.local
+*.local
+
+# Backup files
+*.bak
+*.backup
+*~
+
+# Compressed files
+*.zip
+*.tar.gz
+*.tar.bz2
+*.rar
+*.7z
