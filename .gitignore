@@ -1,7 +1,12 @@
 # Build directories
 build/
+build2/
 cmake-build-*/
 out/
+
+# Runtime data
+benchmark_data/
+data/sift/
 
 # IDE and editor files
 .idea/

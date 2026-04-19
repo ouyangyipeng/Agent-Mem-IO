@@ -46,10 +46,11 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         -Werror=return-type
         -Werror=uninitialized
         -fPIC
+        -march=native
     )
     
     # Optimization flags for Release build
-    set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -DNDEBUG")
+    set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
     
     # Debug flags
     set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -DDEBUG")
@@ -103,12 +104,15 @@ set(CORE_SOURCES
     src/core/vamana_builder.cpp
     src/core/distance.cpp
     src/core/vector_dataset.cpp
+    src/core/pq_encoder.cpp
+    src/core/simd_distance.cpp
 )
 
 set(IO_SOURCES
     src/io/direct_io.cpp
     src/io/io_uring_engine.cpp
     src/io/file_manager.cpp
+    src/io/disk_layout.cpp
 )
 
 set(BUFFER_SOURCES
@@ -218,19 +222,7 @@ target_link_libraries(agent_mem_io_benchmark
     PRIVATE agent_mem_io
 )
 
-# Full benchmark suite (optional)
-if(ENABLE_BENCHMARKS)
-    add_executable(agent_mem_io_full_benchmark
-        benchmarks/benchmark_main.cpp
-        benchmarks/benchmark_search.cpp
-        benchmarks/benchmark_io.cpp
-        benchmarks/benchmark_memory.cpp
-    )
-    
-    target_link_libraries(agent_mem_io_full_benchmark
-        PRIVATE agent_mem_io
-    )
-endif()
+# Full benchmark suite removed (benchmark.cpp is the main benchmark)
 
 # =============================================================================
 # Python Bindings
