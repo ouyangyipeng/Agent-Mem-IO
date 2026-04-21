@@ -28,6 +28,9 @@
 #include "core/visited_bitmap.h"
 #include "core/simd_distance.h"
 #include "io/disk_layout.h"
+#include "io/io_uring_engine.h"
+#include "compaction/memtable.h"
+#include "data/sift_loader.h"
 
 #include <iostream>
 #include <chrono>
@@ -69,6 +72,11 @@ struct BenchmarkConfig {
     bool mixed_workload = false; // Run mixed read-write benchmark
     Size mixed_writes = 500;     // Number of concurrent writes
     Size mixed_duration_ms = 5000; // Mixed workload duration in ms
+    bool use_io_uring = true;    // Use io_uring for async I/O (true if available)
+    bool use_async_prefetch = true; // Enable topology-aware async prefetch
+    std::string sift_base_path = "";  // Path to SIFT1M base .fvecs file
+    std::string sift_query_path = ""; // Path to SIFT1M query .fvecs file
+    std::string sift_gt_path = "";    // Path to SIFT1M ground truth .ivecs file
 };
 
 template<typename Func>
@@ -300,7 +308,8 @@ std::vector<NodeId> diskann_search_enhanced(
     const PQEncoder& pq_encoder,
     const std::vector<Vector>& ssd_data,  // Simulates SSD reads
     DiskIndexReader* disk_reader,
-    VisitedBitmap& visited) {
+    VisitedBitmap& visited,
+    IoEngine* io_engine = nullptr) {  // NEW: IoEngine for async prefetch
 
     if (graph.get_num_nodes() == 0) return {};
 
@@ -328,6 +337,10 @@ std::vector<NodeId> diskann_search_enhanced(
     results.push({d_ep, ep});
     visited.set(ep);
 
+    // If IoEngine is available and disk_reader is open, enable async prefetch
+    bool use_async = (io_engine != nullptr) && (disk_reader != nullptr)
+                     && disk_reader->is_open();
+
     while (!candidates.empty()) {
         auto [cd, cn] = candidates.top();
         candidates.pop();
@@ -340,7 +353,6 @@ std::vector<NodeId> diskann_search_enhanced(
         Size num_neighs = graph.get_num_neighbors(cn);
 
         // Phase 1: PQ ADC pre-filter - estimate which neighbors are worth SSD read
-        // This is the key optimization: avoid reading ALL neighbors from SSD
         std::vector<std::pair<float, NodeId>> pq_filtered;
         for (Size i = 0; i < num_neighs; ++i) {
             NodeId n = neighs[i];
@@ -353,20 +365,46 @@ std::vector<NodeId> diskann_search_enhanced(
         // Sort by PQ estimate (closest PQ neighbors are most likely worth reading)
         std::sort(pq_filtered.begin(), pq_filtered.end());
 
-        // Phase 2: Beam-style batch SSD read
-        // Collect unvisited candidates in batches of beam_width
-        // Process them in groups: read batch → compute distances → update state
+        // === TOPOLOGY-AWARE ASYNC PREFETCH (CPU-I/O overlap) ===
+        //
+        // Key innovation: while CPU computes distances for the CURRENT batch,
+        // we issue async I/O reads for the NEXT batch's candidates.
+        // This is the "next-hop" prefetch pattern required by the competition:
+        //   - When visiting node cn, its neighbors are the "next hop"
+        //   - We submit async reads for these neighbors NOW
+        //   - While CPU computes distances for current results, SSD reads complete
+        //   - When we need these vectors later, they're already in cache
+        //
+        // This achieves genuine CPU-I/O overlap, unlike synchronous preadv.
+
+        // Submit async prefetch for the top neighbors (next-hop topology-aware)
+        if (use_async) {
+            // Collect next-hop IDs for async prefetch (not yet visited)
+            std::vector<NodeId> prefetch_ids;
+            Size prefetch_limit = std::min(pq_filtered.size(),
+                                           static_cast<Size>(beam_width * 2));
+            for (Size j = 0; j < prefetch_limit; ++j) {
+                NodeId n = pq_filtered[j].second;
+                if (!visited.test(n) && !disk_reader->is_cached(n)) {
+                    prefetch_ids.push_back(n);
+                }
+            }
+
+            if (!prefetch_ids.empty()) {
+                // Submit async batch read via IoEngine (io_uring or pread fallback)
+                // These reads will complete in the background while we compute
+                disk_reader->submit_async_batch(prefetch_ids);
+            }
+        }
+
+        // Phase 2: Beam-style batch SSD read (synchronous for current batch)
         Size processed = 0;
         while (processed < pq_filtered.size()) {
-            // Determine this batch: take up to beam_width candidates
-            // But only those whose PQ estimate is promising enough
             Size batch_end = std::min(processed + beam_width, pq_filtered.size());
 
-            // Collect node IDs for this batch that haven't been visited yet
             std::vector<NodeId> batch_ids;
             for (Size j = processed; j < batch_end; ++j) {
                 NodeId n = pq_filtered[j].second;
-                // Double-check visited (might have been set by earlier batch)
                 if (!visited.test(n)) {
                     batch_ids.push_back(n);
                 }
@@ -377,22 +415,48 @@ std::vector<NodeId> diskann_search_enhanced(
                 continue;
             }
 
-            // Batch SSD read: read all vectors in this batch at once
-            // This is the key optimization over per-node synchronous reads
+            // Batch SSD read: use async prefetch for ALL batches (not just the first)
+            // This achieves genuine CPU-I/O overlap throughout the entire search,
+            // not just the first iteration as in the previous implementation.
             std::vector<Vector> batch_vectors;
-            if (disk_reader && disk_reader->is_open()) {
-                // Enhanced reader: batch read with cache
+            if (use_async) {
+                // ALL batches: wait for async prefetch results
+                // Async reads were submitted above for next-hop topology-aware prefetch.
+                // Each iteration of the outer loop submits prefetch for its neighbors,
+                // and here we wait for the results that were submitted in previous iterations.
+                disk_reader->wait_async_batch(batch_ids, batch_vectors);
+
+                // Submit async prefetch for the NEXT batch's candidates while we compute
+                // distances for this batch. This keeps I/O and CPU overlapping continuously.
+                if (batch_end < pq_filtered.size()) {
+                    std::vector<NodeId> next_prefetch_ids;
+                    Size next_start = batch_end;
+                    Size next_limit = std::min(
+                        pq_filtered.size(),
+                        next_start + beam_width * 2);
+                    for (Size j = next_start; j < next_limit; ++j) {
+                        NodeId n = pq_filtered[j].second;
+                        if (!visited.test(n) && !disk_reader->is_cached(n)) {
+                            next_prefetch_ids.push_back(n);
+                        }
+                    }
+                    if (!next_prefetch_ids.empty()) {
+                        disk_reader->submit_async_batch(next_prefetch_ids);
+                    }
+                }
+            } else if (disk_reader && disk_reader->is_open()) {
+                // No async: synchronous batch read
                 disk_reader->read_vectors_batch(batch_ids, batch_vectors);
             } else {
-                // Memory simulation: just copy from ssd_data
+                // Memory simulation
                 batch_vectors.resize(batch_ids.size());
                 for (Size j = 0; j < batch_ids.size(); ++j) {
                     batch_vectors[j] = ssd_data[batch_ids[j]];
                 }
             }
 
-            // Phase 3: Compute EXACT distances for all batch vectors
-            // This CPU work happens while the next batch could be prefetching
+            // Phase 3: Compute EXACT distances (CPU work overlapping with I/O)
+            // While computing these distances, the next async batch is completing
             for (Size j = 0; j < batch_ids.size(); ++j) {
                 NodeId n = batch_ids[j];
                 visited.set(n);
@@ -495,7 +559,8 @@ void run_mixed_workload(const BenchmarkConfig& cfg,
                         const FlatGraphIndex& graph,
                         const std::vector<PQCodeVector>& pq_codes,
                         const PQEncoder& pq_encoder,
-                        DiskIndexReader* disk_reader) {
+                        DiskIndexReader* disk_reader,
+                        IoEngine* io_engine = nullptr) {
     std::cout << "\n========================================\n";
     std::cout << "MIXED WORKLOAD BENCHMARK\n";
     std::cout << "========================================\n\n";
@@ -513,23 +578,41 @@ void run_mixed_workload(const BenchmarkConfig& cfg,
     std::vector<double> query_latencies;
     std::atomic<Size> query_count{0};
     std::atomic<Size> write_count{0};
+    std::atomic<Size> write_error_count{0};
     std::atomic<bool> stop_flag{false};
 
-    // Write thread: generates random new vectors and "inserts" them
-    // (In a real system, this would go through MemTable → SSTable)
+    // === REAL LSM-Tree write path (MemTable + WAL) ===
+    // Create LsmWriteManager for real writes, not just counting
+    MemTableConfig memtable_config;
+    memtable_config.max_entries = 1000;  // Small for benchmark
+    memtable_config.max_size = 1 * 1024 * 1024;  // 1MB
+    CompactionConfig compaction_config;
+    compaction_config.enable_background_compaction = true;  // Enable for realistic write amplification measurement
+
+    std::unique_ptr<LsmWriteManager> write_manager;
+    write_manager = std::make_unique<LsmWriteManager>(
+        "./benchmark_data/wal_test", memtable_config, compaction_config);
+    write_manager->init();
+
+    // Write thread: REAL MemTable insert + WAL (no longer just counting)
     std::thread write_thread([&]() {
         std::mt19937 rng(12345);
-        std::normal_distribution<float> ndist(0.0f, 0.1f);
         std::uniform_real_distribution<float> udist(-1.0f, 1.0f);
 
         while (!stop_flag.load()) {
-            // Simulate a write: create a random vector (Agent memory)
+            // Real write: create a random vector (Agent memory)
             Vector new_vec(cfg.dimension);
             for (auto& x : new_vec) x = udist(rng);
 
-            // In real system: MemTable insert + WAL
-            // For benchmark: just count the write
-            write_count.fetch_add(1);
+            // REAL LSM-Tree write: WAL + MemTable insert
+            NodeId assigned_id;
+            Error err = write_manager->insert(new_vec, assigned_id);
+
+            if (err.ok()) {
+                write_count.fetch_add(1);
+            } else {
+                write_error_count.fetch_add(1);
+            }
         }
     });
 
@@ -544,7 +627,7 @@ void run_mixed_workload(const BenchmarkConfig& cfg,
         search_results[i] = diskann_search_enhanced(
             queries[i], cfg.k, cfg.ef_search, cfg.beam_width,
             graph, pq_codes, pq_encoder,
-            base, disk_reader, visited);
+            base, disk_reader, visited, io_engine);
         auto q_end = std::chrono::high_resolution_clock::now();
         query_latencies.push_back(
             std::chrono::duration<double, std::milli>(q_end - q_start).count());
@@ -557,6 +640,25 @@ void run_mixed_workload(const BenchmarkConfig& cfg,
 
     stop_flag.store(true);
     write_thread.join();
+
+    // === LSM-Tree Read-back Verification ===
+    // Verify that written vectors are searchable through the LSM-Tree read path
+    Size total_written = write_count.load();
+    Size read_back_success = 0;
+    Size read_back_verified = std::min(static_cast<Size>(100), total_written);
+
+    if (total_written > 0) {
+        // Try to read back the first N written vectors by their IDs (0-based from LSM)
+        // LSM assigns IDs starting from 0 for write_manager inserts
+        for (Size verify_id = 0; verify_id < read_back_verified; ++verify_id) {
+            Vector read_vec(cfg.dimension);
+            if (write_manager->get(static_cast<NodeId>(verify_id), read_vec)) {
+                read_back_success++;
+            }
+        }
+    }
+    float read_back_rate = (read_back_verified > 0)
+        ? (static_cast<float>(read_back_success) / read_back_verified * 100.0f) : 0.0f;
 
     // Calculate mixed workload metrics
     float recall = calculate_recall(search_results, gt, cfg.k);
@@ -575,7 +677,9 @@ void run_mixed_workload(const BenchmarkConfig& cfg,
     std::cout << "  P99.9 latency:     " << p999 << " ms\n";
     std::cout << "  Write TPS:         " << write_tps << "\n";
     std::cout << "  Total queries:     " << query_count.load() << "\n";
-    std::cout << "  Total writes:      " << write_count.load() << "\n\n";
+    std::cout << "  Total writes:      " << write_count.load() << "\n";
+    std::cout << "  LSM read-back:     " << read_back_success << "/" << read_back_verified
+              << " (" << std::fixed << std::setprecision(1) << read_back_rate << "% searchable)\n\n";
 }
 
 // =============================================================================
@@ -599,34 +703,71 @@ void run_benchmark(const BenchmarkConfig& cfg) {
     std::cout << "  Beam Width: " << cfg.beam_width << "\n";
     std::cout << "  SIMD Level: " << get_simd_level() << "\n\n";
 
-    // Step 1: Generate clustered data
-    std::cout << "[Step 1] Generating data...\n";
-    std::mt19937 rng(42);
-    std::normal_distribution<float> ndist(0.0f, 0.1f);
-    std::uniform_real_distribution<float> udist(-1.0f, 1.0f);
+    // Step 1: Load SIFT1M or generate synthetic data
+    std::vector<Vector> base;
+    std::vector<Vector> queries;
+    std::vector<std::vector<NodeId>> groundtruth_external;
 
-    Size num_clusters = 100;
-    std::vector<Vector> centers(num_clusters);
-    for (auto& c : centers) {
-        c.resize(cfg.dimension);
-        for (auto& v : c) v = udist(rng);
+    if (!cfg.sift_base_path.empty()) {
+        // === SIFT1M REAL DATASET (competition requirement) ===
+        std::cout << "[Step 1] Loading SIFT1M dataset...\n";
+        try {
+            base = SiftLoader::load_fvecs(cfg.sift_base_path);
+            std::cout << "  Base vectors: " << base.size() << " (dim=" << base[0].size() << ")\n";
+
+            if (!cfg.sift_query_path.empty()) {
+                queries = SiftLoader::load_fvecs(cfg.sift_query_path);
+                std::cout << "  Query vectors: " << queries.size() << "\n";
+            } else {
+                std::mt19937 rng(42);
+                queries.resize(cfg.num_queries);
+                std::uniform_int_distribution<int> qdist(0, base.size() - 1);
+                for (Size i = 0; i < cfg.num_queries && i < queries.size(); ++i) {
+                    queries[i] = base[qdist(rng)];
+                }
+            }
+
+            if (!cfg.sift_gt_path.empty()) {
+                groundtruth_external = SiftLoader::load_groundtruth(cfg.sift_gt_path);
+                std::cout << "  Ground truth: " << groundtruth_external.size() << " queries\n";
+            }
+
+            std::cout << "  SIFT1M dataset loaded successfully\n\n";
+        } catch (const std::exception& e) {
+            std::cerr << "  Failed to load SIFT: " << e.what() << "\n  Falling back to synthetic\n\n";
+        }
     }
 
-    std::vector<Vector> base(cfg.num_vectors);
-    std::uniform_int_distribution<int> cdist(0, num_clusters - 1);
-    for (auto& v : base) {
-        v = centers[cdist(rng)];
-        for (auto& x : v) x += ndist(rng);
-    }
+    if (base.empty()) {
+        // === SYNTHETIC DATA (fallback or default) ===
+        std::cout << "[Step 1] Generating synthetic data...\n";
+        std::mt19937 rng(42);
+        std::normal_distribution<float> ndist(0.0f, 0.1f);
+        std::uniform_real_distribution<float> udist(-1.0f, 1.0f);
 
-    std::vector<Vector> queries(cfg.num_queries);
-    std::uniform_int_distribution<int> qdist(0, cfg.num_vectors - 1);
-    for (Size i = 0; i < cfg.num_queries; ++i) {
-        queries[i] = base[qdist(rng)];
-        for (auto& x : queries[i]) x += ndist(rng) * 0.5f;
+        Size num_clusters = 100;
+        std::vector<Vector> centers(num_clusters);
+        for (auto& c : centers) {
+            c.resize(cfg.dimension);
+            for (auto& v : c) v = udist(rng);
+        }
+
+        base.resize(cfg.num_vectors);
+        std::uniform_int_distribution<int> cdist(0, num_clusters - 1);
+        for (auto& v : base) {
+            v = centers[cdist(rng)];
+            for (auto& x : v) x += ndist(rng);
+        }
+
+        queries.resize(cfg.num_queries);
+        std::uniform_int_distribution<int> qdist(0, cfg.num_vectors - 1);
+        for (Size i = 0; i < cfg.num_queries; ++i) {
+            queries[i] = base[qdist(rng)];
+            for (auto& x : queries[i]) x += ndist(rng) * 0.5f;
+        }
+        std::cout << "  Done: " << cfg.num_vectors << " vectors, "
+                  << cfg.num_queries << " queries\n\n";
     }
-    std::cout << "  Done: " << cfg.num_vectors << " vectors, "
-              << cfg.num_queries << " queries\n\n";
 
     // Step 2: Train PQ encoder
     std::cout << "[Step 2] Training PQ encoder...\n";
@@ -650,8 +791,10 @@ void run_benchmark(const BenchmarkConfig& cfg) {
     std::cout << "  Build time: " << build_t << " ms\n";
     std::cout << "  Graph memory: " << graph.calculate_memory_usage() / 1024.0 / 1024.0 << " MB\n\n";
 
-    // Step 5: Write to SSD (optional)
+    // Step 5: Write to SSD (optional) + Initialize IoEngine
     std::unique_ptr<DiskIndexReader> disk_reader;
+    std::unique_ptr<IoEngine> io_engine;
+
     if (cfg.use_disk) {
         std::cout << "[Step 5] Writing index to SSD...\n";
         DiskIndexWriter disk_writer("./benchmark_data", cfg.num_vectors,
@@ -672,6 +815,16 @@ void run_benchmark(const BenchmarkConfig& cfg) {
                                                          cfg.num_vectors, cfg.max_degree);
         disk_reader->open();
 
+        // Initialize IoEngine for async I/O (io_uring when available)
+        // This enables true CPU-I/O overlap during graph traversal search
+        if (cfg.use_io_uring && cfg.use_async_prefetch) {
+            io_engine = std::make_unique<IoEngine>(IoEngineConfig());
+            io_engine->init();
+            disk_reader->set_io_engine(io_engine.get());
+            std::cout << "  IoEngine: io_uring=" << (io_engine->using_io_uring() ? "YES" : "NO (pread fallback)")
+                      << "\n";
+        }
+
         // Configure cache: auto-calculate capacity based on memory budget
         // Available cache = 20% budget - (PQ + graph + visited fixed overhead)
         // This ensures total memory stays within 10-20% range
@@ -686,10 +839,11 @@ void run_benchmark(const BenchmarkConfig& cfg) {
         Size cache_cap = cfg.cache_capacity;
         if (cache_cap == 0) {
             // Budget: 20% of dataset - fixed overhead = available for cache
+            // BufferPoolManager uses 4KB pages (DISK_RECORD_SIZE), one per node
             Size budget_20pct = ds_size / 5;
             Size available_cache_mem = budget_20pct - fixed_mem;
             if (available_cache_mem > 0) {
-                cache_cap = available_cache_mem / VectorCache::ENTRY_MEMORY;
+                cache_cap = available_cache_mem / DISK_RECORD_SIZE;
                 cache_cap = std::max(cache_cap, static_cast<Size>(20));
                 cache_cap = std::min(cache_cap, cfg.num_vectors / 10);
             } else {
@@ -697,6 +851,20 @@ void run_benchmark(const BenchmarkConfig& cfg) {
             }
         }
         disk_reader->set_cache_capacity(cache_cap);
+
+        // Compute in-degrees for Graph-Aware 2Q eviction policy
+        // Hub nodes (high in-degree) will be protected from eviction
+        std::vector<uint32_t> in_degrees(cfg.num_vectors, 0);
+        for (Size nid = 0; nid < cfg.num_vectors; ++nid) {
+            const NodeId* neighs = graph.get_neighbors(nid);
+            Size num_n = graph.get_num_neighbors(nid);
+            for (Size j = 0; j < num_n; ++j) {
+                if (neighs[j] < cfg.num_vectors) {
+                    in_degrees[neighs[j]]++;
+                }
+            }
+        }
+        disk_reader->update_in_degrees(in_degrees);
         std::cout << "\n";
     } else {
         std::cout << "[Step 5] SSD write skipped (use_disk=false)\n\n";
@@ -728,7 +896,7 @@ void run_benchmark(const BenchmarkConfig& cfg) {
             search_results[i] = diskann_search_enhanced(
                 queries[i], cfg.k, cfg.ef_search, cfg.beam_width,
                 graph, pq_codes, pq_encoder,
-                base, disk_reader.get(), visited);
+                base, disk_reader.get(), visited, io_engine.get());
             auto q_end = std::chrono::high_resolution_clock::now();
             query_latencies[i] = std::chrono::duration<double, std::milli>(
                 q_end - q_start).count();
@@ -821,7 +989,7 @@ void run_benchmark(const BenchmarkConfig& cfg) {
     // Mixed workload test (optional)
     if (cfg.mixed_workload) {
         run_mixed_workload(cfg, base, queries, graph, pq_codes,
-                           pq_encoder, disk_reader.get());
+                           pq_encoder, disk_reader.get(), io_engine.get());
     }
 
     if (disk_reader) disk_reader->close();
@@ -843,6 +1011,11 @@ int main(int argc, char* argv[]) {
         else if (a == "--beam-width" && i+1 < argc) cfg.beam_width = std::stoul(argv[++i]);
         else if (a == "--cache-capacity" && i+1 < argc) cfg.cache_capacity = std::stoul(argv[++i]);
         else if (a == "--no-disk") cfg.use_disk = false;
+        else if (a == "--no-io-uring") cfg.use_io_uring = false;
+        else if (a == "--no-async-prefetch") cfg.use_async_prefetch = false;
+        else if (a == "--sift-base" && i+1 < argc) cfg.sift_base_path = argv[++i];
+        else if (a == "--sift-query" && i+1 < argc) cfg.sift_query_path = argv[++i];
+        else if (a == "--sift-gt" && i+1 < argc) cfg.sift_gt_path = argv[++i];
         else if (a == "--mixed") cfg.mixed_workload = true;
         else if (a == "--mixed-writes" && i+1 < argc) cfg.mixed_writes = std::stoul(argv[++i]);
         else if (a == "--mixed-duration" && i+1 < argc) cfg.mixed_duration_ms = std::stoul(argv[++i]);
@@ -862,6 +1035,11 @@ int main(int argc, char* argv[]) {
             std::cout << "  --beam-width <n>  SSD batch prefetch width (default: 4)\n";
             std::cout << "  --cache-capacity <n>  Vector cache entries (default: auto)\n";
             std::cout << "  --no-disk         Skip SSD writes (memory simulation)\n";
+            std::cout << "  --no-io-uring     Disable io_uring (use pread fallback)\n";
+            std::cout << "  --no-async-prefetch  Disable topology-aware async prefetch\n";
+            std::cout << "  --sift-base <path>    SIFT1M base .fvecs file\n";
+            std::cout << "  --sift-query <path>   SIFT1M query .fvecs file\n";
+            std::cout << "  --sift-gt <path>      SIFT1M ground truth .ivecs file\n";
             std::cout << "  --mixed           Run mixed read-write workload\n";
             std::cout << "  --mixed-writes <n>    Concurrent writes (default: 500)\n";
             std::cout << "  --mixed-duration <n>  Duration in ms (default: 5000)\n";

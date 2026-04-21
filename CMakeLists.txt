@@ -167,11 +167,14 @@ target_link_libraries(agent_mem_io
 )
 
 # io_uring compile definition and linking
+# USE_IOURING must be PUBLIC because io_uring_engine.h uses #if USE_IOURING
+# to conditionally define class members (IoEngine::io_uring_engine_ etc).
+# Without PUBLIC, consumers see a different class layout → ODR violation → crash.
 if(IOURING_FOUND)
-    target_link_libraries(agent_mem_io PRIVATE ${IOURING_LIBRARY})
-    target_compile_definitions(agent_mem_io PRIVATE USE_IOURING=1)
+    target_link_libraries(agent_mem_io PUBLIC ${IOURING_LIBRARY})
+    target_compile_definitions(agent_mem_io PUBLIC USE_IOURING=1)
 else()
-    target_compile_definitions(agent_mem_io PRIVATE USE_IOURING=0)
+    target_compile_definitions(agent_mem_io PUBLIC USE_IOURING=0)
 endif()
 
 # =============================================================================

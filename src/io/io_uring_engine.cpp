@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <cstring>
+#include <iostream>
 #include <system_error>
 
 namespace agent_mem_io {
@@ -246,14 +247,59 @@ Error IoUringEngine::submit(const IoRequest& request) {
 }
 
 Size IoUringEngine::submit_batch(const std::vector<IoRequest>& requests) {
-    Size count = 0;
+    // TRUE batch submission: fill ALL SQEs first, then submit ONCE
+    // This is the key io_uring optimization - one submission syscall for
+    // all reads, rather than one syscall per read (which defeats the purpose).
+    //
+    // Without this, io_uring performs no better than synchronous pread
+    // because each io_uring_submit() is a syscall that blocks until the
+    // kernel processes the SQE.
+
+    Size sqe_count = 0;
+
+    // Phase 1: Fill all SQEs without submitting
     for (const auto& req : requests) {
-        Error err = submit(req);
-        if (err.ok()) {
-            count++;
+        struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+        if (!sqe) {
+            // SQE ring is full - submit what we have so far, then try again
+            if (sqe_count > 0) {
+                int ret = io_uring_submit(&ring_);
+                if (ret < 0) {
+                    std::cerr << "[IoUringEngine] Partial submit failed: "
+                              << strerror(-ret) << "\n";
+                    return sqe_count;
+                }
+            }
+            // Try to get another SQE after submission
+            sqe = io_uring_get_sqe(&ring_);
+            if (!sqe) {
+                // Ring is completely full, skip this request
+                continue;
+            }
         }
+
+        if (req.is_read) {
+            io_uring_prep_read(sqe, req.fd, req.buffer, req.size, req.offset);
+        } else {
+            io_uring_prep_write(sqe, req.fd, req.buffer, req.size, req.offset);
+        }
+
+        io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(static_cast<uintptr_t>(req.node_id)));
+        sqe_count++;
     }
-    return count;
+
+    // Phase 2: Submit ALL filled SQEs in ONE syscall
+    if (sqe_count > 0) {
+        int ret = io_uring_submit(&ring_);
+        if (ret < 0) {
+            std::cerr << "[IoUringEngine] Batch submit failed: "
+                      << strerror(-ret) << "\n";
+            return 0;
+        }
+        total_submitted_ += sqe_count;
+    }
+
+    return sqe_count;
 }
 
 Error IoUringEngine::submit_read(
@@ -378,22 +424,113 @@ IoCompletion IoUringEngine::process_cqe(struct io_uring_cqe* cqe) {
 }
 
 int IoUringEngine::register_file(int fd) {
-    // TODO: Implement file registration
-    return -1;
+    if (!initialized_) {
+        return -1;
+    }
+
+    // io_uring_register_files requires an array of fds
+    // We maintain registered_files_ and update the kernel registration
+    int index = static_cast<int>(registered_files_.size());
+
+    // Append the fd to our tracked list
+    registered_files_.push_back(fd);
+
+    // Re-register the entire file table with the kernel
+    // IORING_REGISTER_FILES updates the full array
+    int ret = io_uring_register_files(&ring_, registered_files_.data(),
+                                       static_cast<unsigned>(registered_files_.size()));
+    if (ret < 0) {
+        // Registration failed — rollback our local tracking
+        registered_files_.pop_back();
+        return -1;
+    }
+
+    return index;
 }
 
 Error IoUringEngine::unregister_file(int index) {
-    // TODO: Implement file unregistration
+    if (!initialized_ || index < 0 || index >= static_cast<int>(registered_files_.size())) {
+        return Error::invalid_argument("Invalid file index for unregistration");
+    }
+
+    // Replace the entry with -1 (IORING_REGISTER_FILES_SKIP)
+    // This frees the slot without requiring a full re-registration
+    registered_files_[index] = -1;
+
+    // Update the kernel file table
+    int ret = io_uring_register_files(&ring_, registered_files_.data(),
+                                       static_cast<unsigned>(registered_files_.size()));
+    if (ret < 0) {
+        // Restore the original fd on failure
+        // (We don't know the original, but the slot is now invalid in kernel too)
+        return Error::io_error("Failed to update registered files table");
+    }
+
     return Error::success();
 }
 
 int IoUringEngine::register_buffer(char* buffer, Size size) {
-    // TODO: Implement buffer registration
-    return -1;
+    if (!initialized_) {
+        return -1;
+    }
+
+    int index = static_cast<int>(registered_buffers_.size());
+
+    // Track locally first
+    registered_buffers_.emplace_back(buffer, size);
+
+    // Re-register the entire buffer table with the kernel
+    // Build the iovec array for io_uring_register_buffers
+    std::vector<struct iovec> iovs;
+    iovs.reserve(registered_buffers_.size());
+    for (const auto& [buf, sz] : registered_buffers_) {
+        iovs.push_back({.iov_base = buf, .iov_len = sz});
+    }
+
+    int ret = io_uring_register_buffers(&ring_, iovs.data(),
+                                         static_cast<unsigned>(iovs.size()));
+    if (ret < 0) {
+        // Registration failed — rollback
+        registered_buffers_.pop_back();
+        return -1;
+    }
+
+    return index;
 }
 
 Error IoUringEngine::unregister_buffer(int index) {
-    // TODO: Implement buffer unregistration
+    if (!initialized_ || index < 0 || index >= static_cast<int>(registered_buffers_.size())) {
+        return Error::invalid_argument("Invalid buffer index for unregistration");
+    }
+
+    // Mark the slot as freed (null buffer)
+    registered_buffers_[index] = {nullptr, 0};
+
+    // Re-register the full buffer table (skip null entries would require
+    // compaction, but we do full re-registration for simplicity)
+    std::vector<struct iovec> iovs;
+    iovs.reserve(registered_buffers_.size());
+    for (const auto& [buf, sz] : registered_buffers_) {
+        if (buf != nullptr) {
+            iovs.push_back({.iov_base = buf, .iov_len = sz});
+        }
+    }
+
+    // If no buffers remain, just unregister all
+    if (iovs.empty()) {
+        io_uring_unregister_buffers(&ring_);
+        registered_buffers_.clear();
+        return Error::success();
+    }
+
+    // Unregister old and register new (kernel requires full replacement)
+    io_uring_unregister_buffers(&ring_);
+    int ret = io_uring_register_buffers(&ring_, iovs.data(),
+                                         static_cast<unsigned>(iovs.size()));
+    if (ret < 0) {
+        return Error::io_error("Failed to re-register buffers after unregistration");
+    }
+
     return Error::success();
 }
 

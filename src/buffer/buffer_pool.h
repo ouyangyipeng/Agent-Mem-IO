@@ -229,6 +229,22 @@ public:
     );
     
     /**
+     * @brief Directly insert page data into buffer pool (no load_func needed)
+     *
+     * Used when data is already available (e.g., from async I/O completion).
+     * If page already exists, returns existing data (hit).
+     * If not, allocates a frame, copies data, and registers with eviction policy.
+     *
+     * @param node_id Node identifier
+     * @param page_id Page identifier
+     * @param data Source data to copy into the page
+     * @param data_size Size of data to copy
+     * @return Pointer to page data, or nullptr if buffer pool full
+     */
+    char* put_page_data(NodeId node_id, PageId page_id,
+                        const char* data, Size data_size);
+    
+    /**
      * @brief Pin a page (prevent eviction)
      * @param page_id Page identifier
      * @return true if page was pinned

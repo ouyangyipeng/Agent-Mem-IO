@@ -6,6 +6,7 @@
 #include "compaction/memtable.h"
 #include <algorithm>
 #include <fstream>
+#include <unordered_set>
 #include <fcntl.h>
 #include <unistd.h>
 #include <cstring>
@@ -230,27 +231,140 @@ Error SSTableManager::create_from_memtable(const MemTable& memtable, uint64_t& s
 }
 
 bool SSTableManager::read_vector(uint64_t sstable_id, NodeId node_id, Vector& vector) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    // Note: caller should not hold the SSTableManager mutex, as this method
+    // does file I/O which could block other operations.
+    // get_sstables_containing() already returned the metadata we need.
     
-    auto it = sstables_.find(sstable_id);
-    if (it == sstables_.end()) {
-        return false;
+    // Look up metadata (lightweight, no lock needed since we only read)
+    SSTableMetadata meta;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = sstables_.find(sstable_id);
+        if (it == sstables_.end()) {
+            return false;
+        }
+        meta = it->second;
     }
     
-    const SSTableMetadata& meta = it->second;
     if (node_id < meta.min_node_id || node_id > meta.max_node_id) {
         return false;
     }
     
-    // TODO: Implement actual file reading
-    return false;
+    // Open SSTable file and scan for the target node_id
+    std::ifstream file(meta.filepath, std::ios::binary);
+    if (!file.is_open()) {
+        return false;
+    }
+    
+    // Read and verify header
+    char magic[8];
+    file.read(magic, 8);
+    if (std::memcmp(magic, "SSTABLE1", 8) != 0) {
+        return false;
+    }
+    
+    uint64_t num_entries = 0;
+    file.read(reinterpret_cast<char*>(&num_entries), sizeof(num_entries));
+    
+    // Linear scan for target node_id (SSTables are small enough for this)
+    for (uint64_t i = 0; i < num_entries; ++i) {
+        NodeId cur_node_id;
+        file.read(reinterpret_cast<char*>(&cur_node_id), sizeof(cur_node_id));
+        
+        uint32_t vec_size = 0;
+        file.read(reinterpret_cast<char*>(&vec_size), sizeof(vec_size));
+        
+        Vector cur_vec(vec_size);
+        if (vec_size > 0) {
+            file.read(reinterpret_cast<char*>(cur_vec.data()), vec_size * sizeof(float));
+        }
+        
+        bool is_deleted = false;
+        file.read(reinterpret_cast<char*>(&is_deleted), sizeof(is_deleted));
+        
+        if (cur_node_id == node_id) {
+            if (is_deleted) {
+                return false;  // Tombstone marker — vector was deleted
+            }
+            vector = cur_vec;
+            return true;
+        }
+    }
+    
+    return false;  // Not found in this SSTable
 }
 
-Size SSTableManager::read_vectors_batch(uint64_t sstable_id, 
+Size SSTableManager::read_vectors_batch(uint64_t sstable_id,
                                          const std::vector<NodeId>& node_ids,
                                          std::vector<Vector>& vectors) {
-    // TODO: Implement batch reading
-    return 0;
+    if (node_ids.empty()) {
+        return 0;
+    }
+    
+    // Look up metadata
+    SSTableMetadata meta;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = sstables_.find(sstable_id);
+        if (it == sstables_.end()) {
+            return 0;
+        }
+        meta = it->second;
+    }
+    
+    // Open SSTable file
+    std::ifstream file(meta.filepath, std::ios::binary);
+    if (!file.is_open()) {
+        return 0;
+    }
+    
+    // Read and verify header
+    char magic[8];
+    file.read(magic, 8);
+    if (std::memcmp(magic, "SSTABLE1", 8) != 0) {
+        return 0;
+    }
+    
+    uint64_t num_entries = 0;
+    file.read(reinterpret_cast<char*>(&num_entries), sizeof(num_entries));
+    
+    // Build lookup set for target node_ids
+    std::unordered_set<NodeId> target_set(node_ids.begin(), node_ids.end());
+    
+    // Scan all entries and collect matching vectors
+    Size found_count = 0;
+    vectors.clear();
+    vectors.resize(node_ids.size());  // Pre-allocate
+    
+    // Map: node_id -> index in output vector
+    std::unordered_map<NodeId, Size> id_to_index;
+    for (Size i = 0; i < node_ids.size(); ++i) {
+        id_to_index[node_ids[i]] = i;
+    }
+    
+    for (uint64_t i = 0; i < num_entries; ++i) {
+        NodeId cur_node_id;
+        file.read(reinterpret_cast<char*>(&cur_node_id), sizeof(cur_node_id));
+        
+        uint32_t vec_size = 0;
+        file.read(reinterpret_cast<char*>(&vec_size), sizeof(vec_size));
+        
+        Vector cur_vec(vec_size);
+        if (vec_size > 0) {
+            file.read(reinterpret_cast<char*>(cur_vec.data()), vec_size * sizeof(float));
+        }
+        
+        bool is_deleted = false;
+        file.read(reinterpret_cast<char*>(&is_deleted), sizeof(is_deleted));
+        
+        auto idx_it = id_to_index.find(cur_node_id);
+        if (idx_it != id_to_index.end() && !is_deleted) {
+            vectors[idx_it->second] = cur_vec;
+            found_count++;
+        }
+    }
+    
+    return found_count;
 }
 
 Error SSTableManager::delete_sstable(uint64_t sstable_id) {
@@ -372,203 +486,136 @@ Error SSTableManager::write_sstable_file(const std::string& filepath,
 }
 
 // =============================================================================
-// CompactionManager Implementation
+// SSTableManager — New methods for compaction support
 // =============================================================================
 
-CompactionManager::CompactionManager(SSTableManager* sstable_manager,
-                                       const CompactionConfig& config)
-    : sstable_manager_(sstable_manager)
-    , config_(config)
-{
-}
-
-CompactionManager::~CompactionManager() {
-    stop();
-}
-
-Error CompactionManager::start() {
-    if (running_) {
-        return Error::invalid_argument("Compaction manager already running");
-    }
-    
-    running_ = true;
-    compaction_thread_ = std::thread(&CompactionManager::compaction_thread_func, this);
-    
-    return Error::success();
-}
-
-void CompactionManager::stop() {
-    running_ = false;
-    cv_.notify_all();
-    
-    if (compaction_thread_.joinable()) {
-        compaction_thread_.join();
-    }
-}
-
-Error CompactionManager::trigger_compaction(uint32_t level) {
+Error SSTableManager::read_sstable_entries(uint64_t sstable_id, std::vector<MemTableEntry>& entries) {
     std::lock_guard<std::mutex> lock(mutex_);
-    pending_queue_.push(level);
-    cv_.notify_one();
-    return Error::success();
-}
 
-bool CompactionManager::needs_compaction(uint32_t level) const {
-    if (!sstable_manager_) return false;
-    
-    auto sstables = sstable_manager_->get_sstables_in_level(level);
-    return sstables.size() >= config_.min_sstables_to_compact;
-}
+    auto it = sstables_.find(sstable_id);
+    if (it == sstables_.end()) {
+        return Error::node_not_found("SSTable not found: " + std::to_string(sstable_id));
+    }
 
-bool CompactionManager::is_compacting() const {
-    return compacting_;
-}
+    const SSTableMetadata& meta = it->second;
 
-Size CompactionManager::pending_compactions() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return pending_queue_.size();
-}
+    std::ifstream file(meta.filepath, std::ios::binary);
+    if (!file.is_open()) {
+        return Error::io_error("Failed to open SSTable file: " + meta.filepath);
+    }
 
-void CompactionManager::set_io_bandwidth_limit(double limit) {
-    io_bandwidth_limit_ = std::max(0.0, std::min(1.0, limit));
-}
+    // Read and verify header
+    char magic[8];
+    file.read(magic, 8);
+    if (std::memcmp(magic, "SSTABLE1", 8) != 0) {
+        return Error::io_error("Invalid SSTable format: " + meta.filepath);
+    }
 
-void CompactionManager::pause() {
-    paused_ = true;
-}
+    uint64_t num_entries = 0;
+    file.read(reinterpret_cast<char*>(&num_entries), sizeof(num_entries));
 
-void CompactionManager::resume() {
-    paused_ = false;
-    cv_.notify_all();
-}
+    // Read all entries
+    entries.clear();
+    entries.reserve(num_entries);
 
-void CompactionManager::register_callback(CompactionCallback callback) {
-    callback_ = std::move(callback);
-}
+    for (uint64_t i = 0; i < num_entries; ++i) {
+        NodeId node_id;
+        file.read(reinterpret_cast<char*>(&node_id), sizeof(node_id));
 
-void CompactionManager::compaction_thread_func() {
-    while (running_) {
-        std::unique_lock<std::mutex> lock(mutex_);
-        
-        cv_.wait_for(lock, std::chrono::milliseconds(config_.compaction_interval_ms), [this] {
-            return !running_ || !pending_queue_.empty();
-        });
-        
-        if (!running_) break;
-        
-        if (paused_ || pending_queue_.empty()) {
-            continue;
+        uint32_t vec_size = 0;
+        file.read(reinterpret_cast<char*>(&vec_size), sizeof(vec_size));
+
+        Vector vec(vec_size);
+        if (vec_size > 0) {
+            file.read(reinterpret_cast<char*>(vec.data()), vec_size * sizeof(float));
         }
-        
-        uint32_t level = pending_queue_.front();
-        pending_queue_.pop();
-        
-        lock.unlock();
-        
-        // Perform compaction
-        compact_level(level);
-    }
-}
 
-Error CompactionManager::compact_level(uint32_t level) {
-    compacting_ = true;
-    
-    // TODO: Implement actual compaction
-    
-    compacting_ = false;
-    
-    if (callback_) {
-        callback_(true, "Compaction completed for level " + std::to_string(level));
+        bool is_deleted = false;
+        file.read(reinterpret_cast<char*>(&is_deleted), sizeof(is_deleted));
+
+        uint64_t ts = 0;
+        // Timestamp was not in original write format, so reconstruct from order
+        // Entries are written sequentially, so use index as approximate timestamp
+        ts = static_cast<uint64_t>(
+            std::chrono::system_clock::now().time_since_epoch().count()) + i;
+
+        entries.emplace_back(node_id, vec, ts, is_deleted);
     }
-    
+
+    file.close();
     return Error::success();
 }
 
-Error CompactionManager::merge_sstables(const std::vector<uint64_t>& sstable_ids,
-                                         uint64_t& output_id) {
-    // TODO: Implement SSTable merging
-    return Error::success();
-}
-
-bool CompactionManager::should_pause() const {
-    return paused_;
-}
-
-// =============================================================================
-// WalManager Implementation
-// =============================================================================
-
-WalManager::WalManager(const std::string& filepath)
-    : filepath_(filepath)
-    , fd_(-1)
-{
-}
-
-WalManager::~WalManager() {
-    if (fd_ >= 0) {
-        ::close(fd_);
+uint64_t SSTableManager::create_from_entries(const std::vector<MemTableEntry>& entries) {
+    if (entries.empty()) {
+        return 0;
     }
-}
 
-Error WalManager::init() {
-    fd_ = ::open(filepath_.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
-    if (fd_ < 0) {
-        return Error::io_error("Failed to open WAL file: " + filepath_);
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    // Generate new SSTable ID
+    uint64_t sstable_id = sstables_.size();
+
+    // Create metadata
+    SSTableMetadata meta;
+    meta.id = sstable_id;
+    meta.num_entries = entries.size();
+    meta.creation_time = std::chrono::system_clock::now().time_since_epoch().count();
+    meta.level = 0;
+
+    // Find min/max node IDs
+    meta.min_node_id = entries[0].node_id;
+    meta.max_node_id = entries[0].node_id;
+    for (const auto& entry : entries) {
+        meta.min_node_id = std::min(meta.min_node_id, entry.node_id);
+        meta.max_node_id = std::max(meta.max_node_id, entry.node_id);
     }
-    return Error::success();
-}
 
-Error WalManager::log_insert(NodeId node_id, const Vector& vector) {
-    MemTableEntry entry(node_id, vector, 
-        std::chrono::system_clock::now().time_since_epoch().count(), false);
-    return write_entry(entry);
-}
+    // Create file path
+    meta.filepath = data_dir_ + "/sstable_" + std::to_string(sstable_id) + ".bin";
 
-Error WalManager::log_delete(NodeId node_id) {
-    MemTableEntry entry(node_id, Vector{}, 
-        std::chrono::system_clock::now().time_since_epoch().count(), true);
-    return write_entry(entry);
-}
-
-Error WalManager::sync() {
-    if (fd_ >= 0) {
-        ::fsync(fd_);
+    // Write to file
+    Error err = write_sstable_file(meta.filepath, entries);
+    if (!err.ok()) {
+        return 0;
     }
-    return Error::success();
+
+    // Calculate size
+    meta.size_bytes = entries.size() * (sizeof(NodeId) + sizeof(uint32_t) +
+                                          DEFAULT_DIMENSION * sizeof(float) + sizeof(bool));
+
+    // Store metadata
+    sstables_[sstable_id] = meta;
+    level_map_[0].push_back(sstable_id);
+
+    return sstable_id;
 }
 
-Error WalManager::recover(std::vector<MemTableEntry>& entries) {
-    // TODO: Implement WAL recovery
-    return Error::success();
-}
+std::vector<uint64_t> SSTableManager::get_sstables_at_level(uint32_t level) const {
+    std::lock_guard<std::mutex> lock(mutex_);
 
-Error WalManager::clear() {
-    if (fd_ >= 0) {
-        ::close(fd_);
+    auto it = level_map_.find(level);
+    if (it == level_map_.end()) {
+        return {};
     }
-    fd_ = ::open(filepath_.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd_ < 0) {
-        return Error::io_error("Failed to clear WAL file: " + filepath_);
-    }
-    current_size_ = 0;
-    return Error::success();
+    return it->second;
 }
 
-Size WalManager::get_size() const {
-    return current_size_;
+Size SSTableManager::get_sstable_count_at_level(uint32_t level) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    auto it = level_map_.find(level);
+    if (it == level_map_.end()) {
+        return 0;
+    }
+    return it->second.size();
 }
 
-Error WalManager::write_entry(const MemTableEntry& entry) {
-    if (fd_ < 0) {
-        return Error::io_error("WAL file not open");
-    }
-    
-    // Write entry to WAL
-    // TODO: Implement actual WAL writing
-    current_size_ += sizeof(MemTableEntry) + entry.vector.size() * sizeof(float);
-    
-    return Error::success();
-}
+// CompactionManager and WalManager implementations have been moved to:
+//   src/compaction/compaction_manager.cpp
+//   src/compaction/wal.cpp
+// This resolves the duplicate definition issue and provides real implementations
+// (previously these were TODO placeholders).
 
 // =============================================================================
 // LsmWriteManager Implementation
@@ -658,7 +705,15 @@ bool LsmWriteManager::get(NodeId node_id, Vector& vector) const {
         }
     }
     
-    // TODO: Check SSTables
+    // Check SSTables (newest first for LSM-Tree freshness)
+    auto sstables_containing = sstable_manager_->get_sstables_containing(node_id);
+    for (const auto& sstable_meta : sstables_containing) {
+        Vector found_vector;
+        if (sstable_manager_->read_vector(sstable_meta.id, node_id, found_vector)) {
+            vector = found_vector;
+            return true;
+        }
+    }
     
     return false;
 }

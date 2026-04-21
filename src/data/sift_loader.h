@@ -18,6 +18,7 @@
 #include <fstream>
 #include <cstring>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace agent_mem_io {
 

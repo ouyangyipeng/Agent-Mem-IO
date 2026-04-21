@@ -305,6 +305,35 @@ public:
      * @return Number of SSTables
      */
     Size get_num_sstables() const;
+    
+    /**
+     * @brief Read all entries from an SSTable file
+     * @param sstable_id SSTable ID to read
+     * @param entries Output entries
+     * @return Error status
+     */
+    Error read_sstable_entries(uint64_t sstable_id, std::vector<MemTableEntry>& entries);
+    
+    /**
+     * @brief Create SSTable from a list of entries (for compaction output)
+     * @param entries Entries to write (sorted by node_id)
+     * @return New SSTable ID, or 0 on failure
+     */
+    uint64_t create_from_entries(const std::vector<MemTableEntry>& entries);
+    
+    /**
+     * @brief Get SSTable IDs at a specific level
+     * @param level Level number
+     * @return Vector of SSTable IDs
+     */
+    std::vector<uint64_t> get_sstables_at_level(uint32_t level) const;
+    
+    /**
+     * @brief Get number of SSTables at a specific level
+     * @param level Level number
+     * @return Number of SSTables
+     */
+    Size get_sstable_count_at_level(uint32_t level) const;
 
 private:
     /**

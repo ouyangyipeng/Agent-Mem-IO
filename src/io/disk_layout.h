@@ -6,6 +6,7 @@
  * reader/writer classes with:
  *   - 4KB-aligned O_DIRECT I/O (SSD-friendly, bypasses OS Page Cache)
  *   - Batch reads via preadv (multiple nodes in fewer syscalls)
+ *   - Async batch reads via io_uring (CPU-I/O overlap for graph traversal)
  *   - LRU vector cache (reduce SSD reads for hot nodes)
  *   - Pre-allocated buffer pool (eliminate per-read alloc/dealloc overhead)
  */
@@ -14,6 +15,8 @@
 
 #include "common/types.h"
 #include "core/pq_encoder.h"
+#include "io/io_uring_engine.h"
+#include "buffer/buffer_pool.h"
 
 #include <vector>
 #include <list>
@@ -21,6 +24,7 @@
 #include <string>
 #include <cstring>
 #include <algorithm>
+#include <memory>
 
 namespace agent_mem_io {
 
@@ -34,8 +38,15 @@ constexpr Size DISK_RECORD_SIZE = 4096;
 /// Maximum graph degree stored on disk (room for 32 neighbors)
 constexpr Size DEFAULT_DISK_MAX_DEGREE = 32;
 
-/// Header size: node_id (4B)
-constexpr Size DISK_RECORD_HEADER_SIZE = sizeof(NodeId);
+/// Header size: node_id (4B) + 12B padding for SIMD alignment
+/// Vector data starts at offset 16 within each 4KB page, ensuring
+/// 16-byte alignment for SSE _mm_load_ps and 32-byte alignment
+/// relative to the page base (which is 4KB-aligned from O_DIRECT).
+constexpr Size DISK_RECORD_HEADER_SIZE = 16;
+
+/// Offset where vector data begins within a disk record
+/// This is aligned to 16 bytes for SIMD access directly from page buffer.
+constexpr Size DISK_VECTOR_OFFSET = DISK_RECORD_HEADER_SIZE;
 
 /// Vector data size: 128 floats
 constexpr Size DISK_VECTOR_DATA_SIZE = DEFAULT_DIMENSION * sizeof(float);
@@ -52,7 +63,10 @@ constexpr Size DISK_VECTOR_DATA_SIZE = DEFAULT_DIMENSION * sizeof(float);
  */
 struct DiskNodeRecord {
     NodeId node_id;
-    float vector_data[DEFAULT_DIMENSION];  // 128 floats
+    /// Vector data aligned to 16 bytes for SSE/AVX2 direct access.
+    /// When populated from a page buffer, the source is also 16-byte aligned
+    /// (DISK_VECTOR_OFFSET = 16 within a 4KB-aligned page).
+    alignas(16) float vector_data[DEFAULT_DIMENSION];  // 128 floats
     Size num_neighbors;                      // actual neighbor count
     NodeId neighbor_ids[DEFAULT_DISK_MAX_DEGREE];  // up to 32 neighbors
     PQCode neighbor_pq_codes[DEFAULT_DISK_MAX_DEGREE * DEFAULT_PQ_M];  // up to 32×8=256 bytes
@@ -104,6 +118,10 @@ struct DiskNodeRecord {
 /**
  * @brief LRU cache for node vectors read from SSD
  *
+ * @deprecated Use BufferPoolManager with Graph-Aware 2Q eviction instead.
+ * VectorCache is retained only for backward compatibility and simple
+ * benchmarks that don't need graph-aware caching.
+ *
  * Caches recently-accessed vectors to reduce SSD reads for hot nodes.
  * Memory usage is strictly controlled to fit within the 10-20% budget.
  *
@@ -111,7 +129,7 @@ struct DiskNodeRecord {
  * Each entry stores the full DiskNodeRecord (vector + neighbor info),
  * so cached nodes can be fully processed without any SSD read.
  */
-class VectorCache {
+class [[deprecated("Use BufferPoolManager with Graph-Aware 2Q instead")]] VectorCache {
 public:
     /**
      * @brief Construct vector cache with given capacity
@@ -266,8 +284,9 @@ private:
  *
  * Enhanced version with:
  *   - Batch reads via preadv (read multiple 4KB records in fewer syscalls)
- *   - LRU vector cache (reduce SSD reads for hot/hub nodes)
- *   - Pre-allocated buffer pool (eliminate per-read alloc/dealloc overhead)
+ *   - Async batch reads via io_uring (CPU-I/O overlap for graph traversal)
+ *   - Graph-Aware 2Q buffer pool (protects hub nodes from eviction)
+ *   - Pre-allocated temp buffer pool (eliminate per-read alloc/dealloc overhead)
  *
  * The cache is critical for graph traversal: hub nodes (entry point,
  * high-degree nodes) are accessed repeatedly across queries.
@@ -341,7 +360,53 @@ public:
      */
     DiskNodeRecord read_record(NodeId node_id);
 
-    // --- Batch reads (NEW) ---
+    // --- Async I/O via io_uring (CPU-I/O overlap for topology-aware prefetch) ---
+    
+    /**
+     * @brief Set IoEngine for async batch reads (io_uring when available)
+     * @param io_engine Pointer to IoEngine instance
+     *
+     * When set, read_vectors_async() will use io_uring for truly async I/O,
+     * enabling CPU-I/O overlap during graph traversal search.
+     */
+    void set_io_engine(IoEngine* io_engine);
+    
+    /**
+     * @brief Issue async batch read for multiple node IDs
+     *
+     * Submits all reads to IoEngine (io_uring if available) and returns
+     * immediately. The caller can continue CPU work while I/O completes
+     * in the background. Call wait_async_batch() to retrieve results.
+     *
+     * This enables the key "CPU-I/O overlap" pattern:
+     *   1. While computing distances for current batch,
+     *      async reads for next batch are completing on SSD
+     *   2. When current batch is done, next batch is already in memory
+     *
+     * @param node_ids List of node IDs to read (cache misses only)
+     * @return Number of async reads submitted
+     */
+    Size submit_async_batch(const std::vector<NodeId>& node_ids);
+    
+    /**
+     * @brief Wait for async batch reads to complete and parse results
+     *
+     * Polls IoEngine for completed reads, parses them into DiskNodeRecords,
+     * stores in cache, and returns vectors for all completed reads.
+     *
+     * @param node_ids The same node_ids passed to submit_async_batch()
+     * @param output_vectors Output vectors (resized to match node_ids)
+     * @return Number of nodes successfully read
+     */
+    Size wait_async_batch(const std::vector<NodeId>& node_ids,
+                          std::vector<Vector>& output_vectors);
+    
+    /**
+     * @brief Check if io_engine is set and using io_uring
+     */
+    bool using_io_uring() const;
+
+    // --- Batch reads (synchronous, for fallback and testing) ---
 
     /**
      * @brief Batch read multiple node vectors from SSD using preadv
@@ -366,44 +431,91 @@ public:
     Size read_records_batch(const std::vector<NodeId>& node_ids,
                             std::vector<DiskNodeRecord>& output_records);
 
-    // --- Vector Cache (NEW) ---
+    // --- Graph-Aware 2Q Buffer Pool Cache ---
 
     /**
-     * @brief Configure vector cache capacity
-     * @param max_entries Maximum number of records to cache (0 = disabled)
+     * @brief Configure cache capacity using Graph-Aware 2Q BufferPoolManager
+     * @param max_pages Maximum number of 4KB pages to cache (0 = disabled)
+     *
+     * Replaces the old LRU VectorCache with BufferPoolManager using
+     * Graph-Aware 2Q eviction policy that protects high in-degree hub nodes.
      */
-    void set_cache_capacity(Size max_entries);
+    void set_cache_capacity(Size max_pages);
 
     /**
-     * @brief Check if a node is cached
+     * @brief Update in-degrees for all cached nodes (Graph-Aware 2Q optimization)
+     * @param in_degrees Vector where in_degrees[node_id] = node's in-degree
+     *
+     * Must be called after graph construction to enable Graph-Aware eviction.
+     * High in-degree nodes (hub nodes) are protected from eviction, ensuring
+     * they stay cached for future queries.
      */
-    bool is_cached(NodeId node_id) const { return cache_.has(node_id); }
+    void update_in_degrees(const std::vector<uint32_t>& in_degrees);
 
     /**
-     * @brief Get cached record (no SSD read)
-     * @return Pointer to cached record, nullptr if not cached
+     * @brief Check if a node is cached in the buffer pool
      */
-    const DiskNodeRecord* get_cached_record(NodeId node_id) { return cache_.get(node_id); }
+    bool is_cached(NodeId node_id) const;
 
     /**
-     * @brief Get cache hit rate
+     * @brief Get cached record parsed from buffer pool (no SSD read)
+     * @return Parsed DiskNodeRecord, or default record if not cached
      */
-    double get_cache_hit_rate() const { return cache_.hit_rate(); }
+    DiskNodeRecord get_cached_record(NodeId node_id);
 
     /**
-     * @brief Get cache memory usage
+     * @brief Compute L2 squared distance directly from BufferPool page buffer
+     *
+     * Key optimization: skips parse_record memcpy. Vector data is at
+     * DISK_VECTOR_OFFSET (16 bytes) within each 4KB-aligned page,
+     * which is 16-byte aligned for SSE _mm_load_ps.
+     *
+     * When the page is cached in BufferPool, this computes distance
+     * directly from the page buffer without copying to a DiskNodeRecord.
+     * When not cached, falls back to read_vector + l2_distance.
+     *
+     * @param node_id Target node whose vector to compare
+     * @param query Query vector
+     * @return L2 squared distance, or -1.0f on error
      */
-    Size get_cache_memory_usage() const { return cache_.memory_usage(); }
+    float compute_distance_direct(NodeId node_id, const Vector& query);
 
     /**
-     * @brief Get cache size (number of entries)
+     * @brief Batch compute L2 squared distances directly from BufferPool
+     *
+     * For each node_id: if cached, compute distance directly from page buffer;
+     * if not cached, read via BufferPool (which triggers I/O) then compute.
+     * Adds software prefetch for next vector to improve cache utilization.
+     *
+     * @param node_ids Target node IDs
+     * @param query Query vector
+     * @param distances Output distances (must have node_ids.size() elements)
+     * @return Number of successful distance computations
      */
-    Size get_cache_size() const { return cache_.size(); }
+    Size compute_distances_batch_direct(
+        const std::vector<NodeId>& node_ids,
+        const Vector& query,
+        std::vector<float>& distances);
 
     /**
-     * @brief Get cache capacity
+     * @brief Get cache hit rate from buffer pool
      */
-    Size get_cache_capacity() const { return cache_.capacity(); }
+    double get_cache_hit_rate() const;
+
+    /**
+     * @brief Get cache memory usage (bytes occupied by buffer pool pages)
+     */
+    Size get_cache_memory_usage() const;
+
+    /**
+     * @brief Get cache size (number of pages in buffer pool)
+     */
+    Size get_cache_size() const;
+
+    /**
+     * @brief Get cache capacity (maximum number of pages)
+     */
+    Size get_cache_capacity() const;
 
     // --- Buffer Pool (NEW) ---
 
@@ -454,12 +566,23 @@ private:
     std::string index_path_;
     int fd_;  // File descriptor (opened with O_DIRECT)
 
-    /// LRU vector cache
-    VectorCache cache_;
+    /// Graph-Aware 2Q buffer pool manager (replaces old LRU VectorCache)
+    /// Each 4KB page stores one node's full record (vector + graph + PQ).
+    /// Eviction uses 2Q algorithm with in-degree protection for hub nodes.
+    std::unique_ptr<BufferPoolManager> buffer_pool_mgr_;
 
-    /// Pre-allocated buffer pool for O_DIRECT reads
+    /// Pre-allocated temp buffer pool for O_DIRECT reads (not for caching)
+    /// These are short-lived buffers used during read operations, returned after use.
     std::vector<char*> buffer_pool_;
-    Size buffer_pool_capacity_ = 64;  // Default: 64 pre-allocated buffers
+    Size buffer_pool_capacity_ = 64;  // Default: 64 pre-allocated temp buffers
+
+    /// IoEngine for async reads (io_uring when available, pread fallback)
+    IoEngine* io_engine_ = nullptr;
+
+    /// Pending async read buffers (node_id -> aligned buffer)
+    /// These buffers are allocated when submitting async reads and
+    /// freed after parsing results in wait_async_batch()
+    std::unordered_map<NodeId, char*> async_buffers_;
 
     /// Allocate a new aligned buffer (for pool initialization and growth)
     static char* alloc_aligned_buffer();

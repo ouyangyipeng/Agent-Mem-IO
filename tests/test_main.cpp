@@ -36,6 +36,8 @@
 #include <random>
 #include <cstring>
 #include <filesystem>
+#include <fcntl.h>
+#include <unistd.h>
 
 using namespace agent_mem_io;
 
@@ -125,10 +127,10 @@ void test_graph_nav_data() {
     nav_data.add_neighbor(0, 2);
     nav_data.add_neighbor(0, 3);
 
-    assert(nav_data.get_num_neighbors(0) == 3);
-    assert(nav_data.get_neighbor(0, 0) == 1);
-    assert(nav_data.get_neighbor(0, 1) == 2);
-    assert(nav_data.get_neighbor(0, 2) == 3);
+    assert(nav_data.get_neighbors(0).size() == 3);
+    assert(nav_data.get_neighbors(0)[0] == 1);
+    assert(nav_data.get_neighbors(0)[1] == 2);
+    assert(nav_data.get_neighbors(0)[2] == 3);
 
     std::cout << "  GraphNavData: PASSED" << std::endl;
 }
@@ -161,7 +163,7 @@ void test_graph_index() {
     Error err = index.build(data);
     assert(err.ok());
 
-    assert(index.get_num_vectors() == 100);
+    assert(index.get_num_nodes() == 100);
     assert(index.get_entry_point() < 100);
 
     // Calculate memory
@@ -492,19 +494,28 @@ void test_lsm_write_manager() {
 
     LsmWriteManager manager(test_dir, mt_config);
 
-    Vector v1 = {1.0f, 2.0f, 3.0f, 4.0f};
-    NodeId id1;
-    Error err = manager.insert(v1, id1);
+    // Must call init() before insert (initializes WAL + CompactionManager)
+    Error err = manager.init();
     assert(err.ok());
 
-    Vector v2 = {5.0f, 6.0f, 7.0f, 8.0f};
+    // Use 128-dim vectors (matching DEFAULT_DIMENSION)
+    Vector v1(DEFAULT_DIMENSION, 0.0f);
+    v1[0] = 1.0f; v1[1] = 2.0f; v1[2] = 3.0f; v1[3] = 4.0f;
+    NodeId id1;
+    err = manager.insert(v1, id1);
+    assert(err.ok());
+    assert(id1 == 0);
+
+    Vector v2(DEFAULT_DIMENSION, 0.0f);
+    v2[0] = 5.0f; v2[1] = 6.0f; v2[2] = 7.0f; v2[3] = 8.0f;
     NodeId id2;
     err = manager.insert(v2, id2);
     assert(err.ok());
+    assert(id2 == 1);
 
     std::filesystem::remove_all(test_dir);
 
-    std::cout << "  LsmWriteManager: PASSED (partial)" << std::endl;
+    std::cout << "  LsmWriteManager: PASSED" << std::endl;
 }
 
 // =============================================================================
@@ -543,7 +554,7 @@ void test_types_and_constants() {
     assert(sizeof(PageId) == 8);
 
     assert(DEFAULT_DIMENSION == 128);
-    assert(DEFAULT_MAX_DEGREE == 16);
+    assert(DEFAULT_MAX_DEGREE == 64);
     assert(INVALID_NODE_ID == std::numeric_limits<NodeId>::max());
     assert(ALIGNMENT == 4096);
     assert(DEFAULT_PQ_M == 8);
@@ -583,6 +594,146 @@ void test_error_handling() {
 }
 
 // =============================================================================
+// Test: io_uring Engine (batch submission verification)
+// =============================================================================
+
+void test_io_uring() {
+    std::cout << "Testing io_uring Engine..." << std::endl;
+
+    // Create test file for I/O
+    std::string test_dir = "./test_io_uring_data";
+    std::filesystem::create_directories(test_dir);
+    std::string test_file = test_dir + "/test_io.bin";
+
+    // Write test data (8 pages = 32KB)
+    int fd = open(test_file.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    assert(fd >= 0);
+    for (int i = 0; i < 8; ++i) {
+        char page[4096];
+        std::memset(page, static_cast<char>(i + 1), 4096);
+        write(fd, page, 4096);
+    }
+    close(fd);
+
+    // Initialize IoEngine (automatically uses io_uring when available)
+    IoEngineConfig config;
+    config.queue_depth = 32;
+    IoEngine io_engine(config);
+
+    Error init_err = io_engine.init();
+    assert(init_err.ok());
+    assert(io_engine.using_io_uring());
+
+    // Test batch read: submit 4 reads via io_uring, wait for all completions
+    int read_fd = open(test_file.c_str(), O_RDONLY);
+    assert(read_fd >= 0);
+
+    // Allocate aligned buffers for batch reads
+    std::vector<char*> buffers(4);
+    for (int i = 0; i < 4; ++i) {
+        buffers[i] = static_cast<char*>(std::aligned_alloc(4096, 4096));
+        assert(buffers[i] != nullptr);
+    }
+
+    std::vector<IoRequest> requests(4);
+    for (int i = 0; i < 4; ++i) {
+        requests[i].fd = read_fd;
+        requests[i].offset = i * 4096;
+        requests[i].size = 4096;
+        requests[i].buffer = buffers[i];
+        requests[i].node_id = static_cast<NodeId>(i);
+        requests[i].is_read = true;
+    }
+
+    // Submit batch (true batch: all SQEs filled then one io_uring_submit call)
+    Size submitted = io_engine.submit_batch_read(requests);
+    assert(submitted == 4);
+
+    // Wait for all completions
+    auto completions = io_engine.wait_completion_batch(4, 1000);
+    assert(completions.size() == 4);
+    for (const auto& comp : completions) {
+        assert(comp.success());
+    }
+
+    // Verify data: each page should have its unique pattern
+    for (int i = 0; i < 4; ++i) {
+        assert(buffers[i][0] == static_cast<char>(i + 1));
+    }
+
+    // Cleanup
+    for (char* b : buffers) free(b);
+    close(read_fd);
+    io_engine.shutdown();
+
+    std::filesystem::remove_all(test_dir);
+    std::cout << "  io_uring Engine: PASSED" << std::endl;
+}
+
+// =============================================================================
+// Test: BufferPoolManager Graph-Aware 2Q Eviction
+// =============================================================================
+
+void test_buffer_pool_graph_aware() {
+    std::cout << "Testing BufferPool Graph-Aware 2Q..." << std::endl;
+
+    BufferPoolConfig config;
+    config.max_pages = 10;
+    config.page_size = PAGE_SIZE;
+    config.hot_queue_ratio = 0.3;
+    config.enable_graph_aware = true;
+    BufferPoolManager pool(config);
+
+    // Load 5 pages with data
+    auto load_func = [](char* buffer, PageId page_id) {
+        std::memset(buffer, static_cast<char>(page_id), PAGE_SIZE);
+    };
+
+    for (PageId i = 0; i < 5; ++i) {
+        char* data = pool.get_or_load_page(i, i, load_func);
+        assert(data != nullptr);
+    }
+
+    assert(pool.size() == 5);
+
+    // Set in-degrees for graph-aware eviction
+    // Node 0 = hub (high in-degree), nodes 1-4 = low in-degree
+    pool.update_in_degree(0, 100);  // Hub node: protected from eviction
+    pool.update_in_degree(1, 2);
+    pool.update_in_degree(2, 1);
+    pool.update_in_degree(3, 1);
+    pool.update_in_degree(4, 1);
+
+    // Load 5 more pages (will trigger eviction of low-degree nodes)
+    for (PageId i = 5; i < 10; ++i) {
+        char* data = pool.get_or_load_page(i, i, load_func);
+        assert(data != nullptr);
+    }
+
+    assert(pool.size() == 10);
+
+    // Verify hub node (0) is still cached (protected by high in-degree)
+    assert(pool.contains(0));
+
+    // Verify hit rate tracking works
+    double hit_rate = pool.get_hit_rate();
+    assert(hit_rate >= 0.0);
+
+    // Test put_page_data: direct data insertion (used by async I/O completion)
+    char new_page_data[PAGE_SIZE];
+    std::memset(new_page_data, 0xFF, PAGE_SIZE);
+    char* inserted = pool.put_page_data(100, 100, new_page_data, PAGE_SIZE);
+    assert(inserted != nullptr);
+
+    // Verify we can read the inserted page
+    char* retrieved = pool.get_page(100, 100);
+    assert(retrieved != nullptr);
+    assert(retrieved[0] == (char)0xFF);
+
+    std::cout << "  BufferPool Graph-Aware 2Q: PASSED" << std::endl;
+}
+
+// =============================================================================
 // Main
 // =============================================================================
 
@@ -599,11 +750,13 @@ int main() {
         test_graph_nav_data();
         test_graph_index();
         test_buffer_pool();
+        test_buffer_pool_graph_aware();
         test_pq_encoder();
         test_visited_bitmap();
         test_disk_layout();
         test_memtable();
         test_lsm_write_manager();
+        test_io_uring();
         test_storage_engine();
 
         std::cout << "========================================" << std::endl;

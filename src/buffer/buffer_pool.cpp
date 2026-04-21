@@ -331,6 +331,67 @@ char* BufferPoolManager::get_or_load_page(
     return frame.data;
 }
 
+char* BufferPoolManager::put_page_data(NodeId node_id, PageId page_id,
+                                         const char* data, Size data_size) {
+    // Check if page already exists (hit)
+    {
+        std::shared_lock<std::shared_mutex> lock(mutex_);
+        auto it = page_table_.find(page_id);
+        if (it != page_table_.end()) {
+            hit_count_++;
+            return frames_[it->second].data;
+        }
+    }
+
+    // Need to insert new page
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+
+    // Double-check after acquiring write lock
+    auto it = page_table_.find(page_id);
+    if (it != page_table_.end()) {
+        hit_count_++;
+        return frames_[it->second].data;
+    }
+
+    // Find a free frame
+    int frame_idx = find_free_frame();
+    if (frame_idx < 0) {
+        // Need to evict
+        if (!evict_page()) {
+            miss_count_++;
+            return nullptr;  // Buffer pool full
+        }
+        frame_idx = find_free_frame();
+    }
+
+    // Allocate buffer if needed
+    PageFrame& frame = frames_[frame_idx];
+    if (!frame.data) {
+        frame.data = allocate_aligned_buffer(config_.page_size);
+    }
+
+    // Copy data into frame
+    Size copy_size = std::min(data_size, config_.page_size);
+    std::memcpy(frame.data, data, copy_size);
+
+    // Update frame metadata
+    frame.page_id = page_id;
+    frame.node_id = node_id;
+    frame.is_valid = true;
+    frame.is_dirty = false;
+    frame.access_count = 1;
+    frame.last_access_time = std::chrono::system_clock::now().time_since_epoch().count();
+
+    // Add to page table
+    page_table_[page_id] = frame_idx;
+
+    // Notify eviction policy
+    eviction_policy_->on_add(page_id, frame.in_degree);
+
+    miss_count_++;
+    return frame.data;
+}
+
 bool BufferPoolManager::pin_page(PageId page_id) {
     std::unique_lock<std::shared_mutex> lock(mutex_);
     

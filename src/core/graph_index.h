@@ -46,6 +46,15 @@ public:
      * @param max_degree Maximum degree per node
      */
     GraphNavData(Size num_nodes, Degree max_degree);
+
+    /**
+     * @brief Add a new node slot to the graph (for incremental insertion)
+     * @return Node ID of the newly added node
+     *
+     * Expands the adjacency list storage to accommodate one more node.
+     * The new node starts with zero neighbors.
+     */
+    NodeId add_node();
     
     /**
      * @brief Get neighbors of a node
@@ -163,10 +172,10 @@ public:
      * @return Error status
      */
     Error add_node_incremental(
+        const std::vector<Vector>& vectors,
         const Vector& new_vector,
         NodeId new_node_id,
-        GraphNavData& nav_data,
-        std::function<Distance(const Vector&, const Vector&)> distance_func
+        GraphNavData& nav_data
     );
     
     /**
@@ -291,6 +300,7 @@ private:
     GraphIndexConfig config_;
     std::unique_ptr<GraphNavData> nav_data_;
     std::unique_ptr<VamanaBuilder> builder_;
+    std::vector<Vector> vectors_;  // Stored for incremental insertion distance computation
     bool is_built_;
     
     mutable std::mutex mutex_;

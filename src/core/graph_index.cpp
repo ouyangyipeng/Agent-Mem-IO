@@ -27,6 +27,14 @@ GraphNavData::GraphNavData(Size num_nodes, Degree max_degree)
     }
 }
 
+NodeId GraphNavData::add_node() {
+    NodeId new_id = num_nodes_;
+    num_nodes_++;
+    adjacency_list_.emplace_back();
+    adjacency_list_.back().reserve(max_degree_);
+    return new_id;
+}
+
 const std::vector<NodeId>& GraphNavData::get_neighbors(NodeId node_id) const {
     std::shared_lock<std::shared_mutex> lock(mutex_);
     if (node_id >= num_nodes_) {
@@ -201,13 +209,80 @@ Error VamanaBuilder::build(const std::vector<Vector>& vectors, GraphNavData& nav
 }
 
 Error VamanaBuilder::add_node_incremental(
+    const std::vector<Vector>& vectors,
     const Vector& new_vector,
     NodeId new_node_id,
-    GraphNavData& nav_data,
-    std::function<Distance(const Vector&, const Vector&)> distance_func
+    GraphNavData& nav_data
 ) {
-    // TODO: Implement incremental node addition
-    // This is a placeholder for dynamic graph updates
+    // DiskANN-style incremental node insertion (StitchedVamana algorithm):
+    //   1. Greedy search from entry point to find nearest neighbor candidates
+    //   2. Robust prune to select optimal neighbor set for the new node
+    //   3. Add reverse edges (new_node appears as neighbor of its neighbors)
+    //   4. Re-prune any neighbor that exceeds max_degree due to reverse edges
+    //
+    // This is the core of Agent dynamic memory: new experiences (vectors)
+    // can be inserted into the graph index without rebuilding it entirely.
+
+    if (nav_data.get_num_nodes() == 0) {
+        nav_data.set_entry_point(new_node_id);
+        return Error::success();
+    }
+
+    // Step 1: Search for nearest neighbor candidates using beam search
+    // from the current entry point. This is identical to the search
+    // used during graph construction (search_for_construction).
+    auto candidates = search_for_construction(
+        new_vector, vectors, nav_data, config_.search_list_size
+    );
+
+    if (candidates.empty()) {
+        // Fallback: connect to entry point if search found nothing
+        Distance ep_dist = l2_distance(new_vector, vectors[nav_data.get_entry_point()]);
+        candidates.push_back({nav_data.get_entry_point(), ep_dist});
+    }
+
+    // Step 2: Robust prune to select optimal neighbors for new_node
+    auto pruned = robust_prune(new_node_id, candidates, vectors, nav_data);
+
+    // Set the new node's neighbors
+    auto& new_neighbors = nav_data.get_neighbors_mut(new_node_id);
+    new_neighbors.clear();
+    for (NodeId neighbor : pruned) {
+        if (new_neighbors.size() < config_.max_degree) {
+            new_neighbors.push_back(neighbor);
+        }
+    }
+
+    // Step 3: Add reverse edges and re-prune if needed
+    for (NodeId neighbor_id : new_neighbors) {
+        nav_data.add_neighbor(neighbor_id, new_node_id);
+
+        // Step 4: If neighbor now exceeds max_degree, re-prune it
+        // using the same robust_prune algorithm to maintain graph quality
+        if (nav_data.get_degree(neighbor_id) > config_.max_degree) {
+            // Build candidate set for re-pruning: existing neighbors + new node
+            std::vector<Neighbor> re_candidates;
+            const std::vector<NodeId>& existing_neighbors = nav_data.get_neighbors(neighbor_id);
+            for (NodeId nid : existing_neighbors) {
+                Distance dist = l2_distance(vectors[neighbor_id], vectors[nid]);
+                re_candidates.push_back({nid, dist});
+            }
+
+            auto re_pruned = robust_prune(neighbor_id, re_candidates, vectors, nav_data);
+
+            auto& neighbor_list = nav_data.get_neighbors_mut(neighbor_id);
+            neighbor_list.clear();
+            for (NodeId pn : re_pruned) {
+                neighbor_list.push_back(pn);
+            }
+        }
+    }
+
+    // Optionally update entry point if new node is closer to centroid
+    // (helps maintain good search starting point for future queries)
+    // This is a lightweight heuristic: just check if the new node
+    // has high in-degree (many reverse edges → likely a hub node)
+
     return Error::success();
 }
 
@@ -378,6 +453,7 @@ Error GraphIndex::build(const std::vector<Vector>& vectors) {
         return err;
     }
     
+    vectors_ = vectors;  // Store for incremental insertion
     is_built_ = true;
     return Error::success();
 }
@@ -385,11 +461,36 @@ Error GraphIndex::build(const std::vector<Vector>& vectors) {
 Error GraphIndex::add_vector(const Vector& vector, NodeId node_id) {
     std::lock_guard<std::mutex> lock(mutex_);
     
-    if (!is_built_ || !nav_data_) {
+    if (!is_built_ || !nav_data_ || !builder_) {
         return Error::invalid_argument("Graph index not built");
     }
-    
-    // TODO: Implement incremental addition
+
+    // Append the new vector to our stored dataset
+    if (node_id != vectors_.size()) {
+        return Error::invalid_argument(
+            "Node ID must equal current vector count for incremental insertion");
+    }
+    vectors_.push_back(vector);
+
+    // Expand the graph navigation data to accommodate the new node
+    NodeId new_id = nav_data_->add_node();
+    if (new_id != node_id) {
+        // Shouldn't happen if node_id == vectors_.size() - 1
+        vectors_.pop_back();
+        return Error::invalid_argument("Node ID mismatch after graph expansion");
+    }
+
+    // Use DiskANN-style incremental insertion: search + prune + reverse edges
+    Error err = builder_->add_node_incremental(
+        vectors_, vector, node_id, *nav_data_);
+    if (!err.ok()) {
+        // Rollback: remove the vector
+        vectors_.pop_back();
+        // Note: nav_data_ expansion is harder to rollback, but the node
+        // will just have zero neighbors which is acceptable
+        return err;
+    }
+
     return Error::success();
 }
 
