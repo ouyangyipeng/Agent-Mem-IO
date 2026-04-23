@@ -32,7 +32,13 @@ public:
      * @param filepath Path to .fvecs file
      * @return Vector of vectors (num_vectors x dimension)
      */
-    static std::vector<Vector> load_fvecs(const std::string& filepath) {
+    /**
+     * @brief Load vectors from .fvecs file with optional subset limit
+     * @param filepath Path to .fvecs file
+     * @param max_vectors Maximum number of vectors to load (0 = all)
+     * @return Vector of float vectors
+     */
+    static std::vector<Vector> load_fvecs(const std::string& filepath, Size max_vectors = 0) {
         std::ifstream file(filepath, std::ios::binary);
         if (!file.is_open()) {
             throw std::runtime_error("Failed to open file: " + filepath);
@@ -60,13 +66,18 @@ public:
         Size vector_bytes = sizeof(int32_t) + dimension * sizeof(float);
         num_vectors = file_size / vector_bytes;
         
+        // Apply subset limit if specified
+        if (max_vectors > 0 && max_vectors < num_vectors) {
+            num_vectors = max_vectors;
+        }
+        
         // Reset to beginning
         file.seekg(0, std::ios::beg);
         
         // Reserve space
         vectors.reserve(num_vectors);
         
-        // Read all vectors
+        // Read vectors (up to num_vectors)
         for (Size i = 0; i < num_vectors; ++i) {
             int32_t d;
             file.read(reinterpret_cast<char*>(&d), sizeof(int32_t));

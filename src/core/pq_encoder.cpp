@@ -7,6 +7,7 @@
  */
 
 #include "core/pq_encoder.h"
+#include "core/simd_distance.h"
 
 #include <algorithm>
 #include <cmath>
@@ -157,6 +158,12 @@ PQCode PQEncoder::find_nearest_centroid(const Vector& subvector, Size subspace_i
 }
 
 float PQEncoder::l2_distance_sq(const Vector& a, const Vector& b) {
+    // Use SIMD-accelerated distance when dimension is compatible
+    // (sub_dim is typically 16, which is a multiple of 4 for SSE and 8 for AVX2)
+    if (a.size() == b.size() && !a.empty()) {
+        return l2_distance_sq_simd(a.data(), b.data(), static_cast<uint32_t>(a.size()));
+    }
+    // Fallback for mismatched dimensions (shouldn't happen in normal PQ usage)
     float sum = 0.0f;
     for (Size i = 0; i < a.size() && i < b.size(); ++i) {
         float diff = a[i] - b[i];
@@ -259,18 +266,16 @@ void PQDistanceTable::build(const Vector& query) {
     const auto& codebooks = encoder_.get_codebooks();
 
     // For each subspace, compute distance from query subvector to all centroids
+    // Using SIMD-accelerated L2 distance computation instead of scalar loop.
+    // sub_dim=16: AVX2 processes 8 floats per op, so 2 AVX2 ops per centroid,
+    // yielding ~4x speedup over the scalar 16-iteration inner loop.
     for (Size j = 0; j < m; ++j) {
-        // Extract query subvector
         Size offset = j * sub_dim;
+        const float* query_sub = query.data() + offset;
 
-        // Compute ||query_sub_j - centroid_j_i||^2 for all i
         for (Size i = 0; i < k; ++i) {
-            float dist_sq = 0.0f;
-            for (Dimension d = 0; d < sub_dim; ++d) {
-                float diff = query[offset + d] - codebooks[j][i][d];
-                dist_sq += diff * diff;
-            }
-            table_[j][i] = dist_sq;
+            table_[j][i] = l2_distance_sq_simd(
+                query_sub, codebooks[j][i].data(), sub_dim);
         }
     }
 

@@ -182,6 +182,33 @@ bool IoEngine::is_initialized() const {
     return initialized_;
 }
 
+int IoEngine::register_file(int fd) {
+#if USE_IOURING
+    if (use_io_uring_ && io_uring_engine_) {
+        return io_uring_engine_->register_file(fd);
+    }
+#endif  // USE_IOURING
+    return -1;  // Not available without io_uring
+}
+
+int IoEngine::register_buffer(char* buffer, Size size) {
+#if USE_IOURING
+    if (use_io_uring_ && io_uring_engine_) {
+        return io_uring_engine_->register_buffer(buffer, size);
+    }
+#endif  // USE_IOURING
+    return -1;  // No io_uring, registration not applicable
+}
+
+Error IoEngine::unregister_buffer(int index) {
+#if USE_IOURING
+    if (use_io_uring_ && io_uring_engine_) {
+        return io_uring_engine_->unregister_buffer(index);
+    }
+#endif  // USE_IOURING
+    return Error::invalid_argument("No io_uring available");
+}
+
 #if USE_IOURING
 // =============================================================================
 // IoUringEngine Implementation

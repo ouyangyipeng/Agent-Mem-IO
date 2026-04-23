@@ -144,7 +144,8 @@ Error VamanaBuilder::build(const std::vector<Vector>& vectors, GraphNavData& nav
     init_random_graph(vectors, nav_data);
     
     // Find medoid as entry point
-    Vector centroid(DEFAULT_DIMENSION, 0.0f);
+    Dimension actual_dim = vectors[0].size();
+    Vector centroid(actual_dim, 0.0f);
     for (const auto& vec : vectors) {
         for (Size i = 0; i < vec.size(); ++i) {
             centroid[i] += vec[i];
@@ -284,6 +285,15 @@ Error VamanaBuilder::add_node_incremental(
     // has high in-degree (many reverse edges → likely a hub node)
 
     return Error::success();
+}
+
+std::vector<Neighbor> VamanaBuilder::search(
+    const Vector& query,
+    const std::vector<Vector>& vectors,
+    const GraphNavData& nav_data,
+    Size ef_search
+) {
+    return search_for_construction(query, vectors, nav_data, ef_search);
 }
 
 std::vector<NodeId> VamanaBuilder::robust_prune(

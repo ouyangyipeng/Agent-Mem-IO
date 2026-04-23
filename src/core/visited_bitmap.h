@@ -22,7 +22,7 @@ public:
      * @brief Construct bitmap for max_num_nodes nodes
      * @param max_num_nodes Maximum number of nodes to track
      */
-    explicit VisitedBitmap(Size max_num_nodes)
+    explicit VisitedBitmap(Size max_num_nodes = 0)
         : size_(max_num_nodes)
         , bitmap_((max_num_nodes + 7) / 8, 0) {
     }
@@ -51,6 +51,15 @@ public:
      */
     void clear() {
         std::memset(bitmap_.data(), 0, bitmap_.size());
+    }
+
+    /**
+     * @brief Resize bitmap for a different number of nodes (reuse allocation)
+     * @param max_num_nodes New maximum number of nodes
+     */
+    void resize(Size max_num_nodes) {
+        size_ = max_num_nodes;
+        bitmap_.assign((max_num_nodes + 7) / 8, 0);
     }
 
     /**

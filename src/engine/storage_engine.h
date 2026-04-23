@@ -24,6 +24,9 @@
 
 namespace agent_mem_io {
 
+// Forward declaration — DiskIndexReader is only used as pointer in QueryProcessor
+class DiskIndexReader;
+
 /**
  * @brief Storage engine configuration
  */
@@ -123,8 +126,10 @@ private:
 
 /**
  * @brief Query processor
- * 
+ *
  * Handles search queries using graph traversal with I/O optimization.
+ * Optimized with VisitedBitmap, SIMD distance, ef_search control,
+ * and compute_distance_direct() for zero-memcpy SSD reads.
  */
 class QueryProcessor {
 public:
@@ -135,13 +140,15 @@ public:
      * @param io_engine I/O engine
      * @param prefetcher Prefetcher
      * @param vector_fd Vector file descriptor
+     * @param disk_reader Optional DiskIndexReader for compute_distance_direct
      */
     QueryProcessor(
         const GraphIndex* graph_index,
         BufferPoolManager* buffer_pool,
         IoEngine* io_engine,
         TopologyAwarePrefetcher* prefetcher,
-        int vector_fd
+        int vector_fd,
+        DiskIndexReader* disk_reader = nullptr
     );
     
     /**
@@ -154,17 +161,19 @@ public:
     Error search(const Vector& query, Size k, SearchResults& results);
     
     /**
-     * @brief Search with beam width control
+     * @brief Search with beam width and ef_search control
      * @param query Query vector
      * @param k Number of neighbors
      * @param beam_width Beam width for search
+     * @param ef_search Search beam width (controls recall/latency tradeoff)
      * @param results Output results
      * @return Error status
      */
     Error search_with_beam_width(
-        const Vector& query, 
-        Size k, 
+        const Vector& query,
+        Size k,
         Size beam_width,
+        Size ef_search,
         SearchResults& results
     );
     
@@ -203,6 +212,7 @@ private:
     BufferPoolManager* buffer_pool_;
     IoEngine* io_engine_;
     TopologyAwarePrefetcher* prefetcher_;
+    DiskIndexReader* disk_reader_;
     int vector_fd_;
     
     // Statistics

@@ -160,6 +160,17 @@ void TwoQueueEvictionPolicy::update_in_degree(PageId page_id, uint32_t in_degree
     in_degree_map_[page_id] = in_degree;
 }
 
+void TwoQueueEvictionPolicy::update_hub_threshold(
+    const std::vector<uint32_t>& in_degrees) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    hub_threshold_ = compute_hub_threshold(in_degrees, hub_percentile_);
+}
+
+uint32_t TwoQueueEvictionPolicy::get_hub_threshold() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return hub_threshold_;
+}
+
 void TwoQueueEvictionPolicy::clear() {
     std::lock_guard<std::mutex> lock(mutex_);
     hot_queue_.clear();
@@ -194,20 +205,33 @@ PageId TwoQueueEvictionPolicy::evict_from_hot_queue() {
         return INVALID_PAGE_ID;
     }
     
-    // Graph-aware: prefer to evict low in-degree nodes
+    // Graph-aware with dynamic hub threshold:
+    // Prefer to evict non-hub nodes (in_degree < hub_threshold_)
+    // If all candidates are hubs, fall back to strict LRU (evict oldest)
     PageId best_candidate = INVALID_PAGE_ID;
     uint32_t min_in_degree = UINT32_MAX;
     
-    // Check last few entries (LRU order)
+    // Check last few entries (LRU order — oldest at back)
     auto it = hot_queue_.end();
     for (int i = 0; i < 10 && it != hot_queue_.begin(); ++i) {
         --it;
         PageId candidate = *it;
         uint32_t in_deg = in_degree_map_[candidate];
+        
+        // Skip hub nodes (protected by dynamic threshold)
+        if (in_deg >= hub_threshold_) {
+            continue;  // This node is a hub, don't evict it
+        }
+        
         if (in_deg < min_in_degree) {
             min_in_degree = in_deg;
             best_candidate = candidate;
         }
+    }
+    
+    // If no non-hub candidate found, fall back to strict LRU
+    if (best_candidate == INVALID_PAGE_ID) {
+        best_candidate = hot_queue_.back();
     }
     
     if (best_candidate != INVALID_PAGE_ID) {
@@ -226,8 +250,8 @@ PageId TwoQueueEvictionPolicy::evict_from_hot_queue() {
 BufferPoolManager::BufferPoolManager(const BufferPoolConfig& config)
     : config_(config)
 {
-    // Initialize frames
-    frames_.resize(config_.max_pages);
+    // Initialize frames (unique_ptr because PageFrame has atomic members — non-copyable)
+    frames_ = std::make_unique<PageFrame[]>(config_.max_pages);
     
     // Initialize free frame list
     for (int i = static_cast<int>(config_.max_pages) - 1; i >= 0; --i) {
@@ -243,9 +267,9 @@ BufferPoolManager::BufferPoolManager(const BufferPoolConfig& config)
 
 BufferPoolManager::~BufferPoolManager() {
     // Free all allocated buffers
-    for (auto& frame : frames_) {
-        if (frame.data) {
-            free_aligned_buffer(frame.data);
+    for (Size i = 0; i < config_.max_pages; ++i) {
+        if (frames_[i].data) {
+            free_aligned_buffer(frames_[i].data);
         }
     }
 }
@@ -401,8 +425,8 @@ bool BufferPoolManager::pin_page(PageId page_id) {
     }
     
     PageFrame& frame = frames_[it->second];
-    frame.is_pinned = true;
-    frame.pin_count++;
+    frame.is_pinned.store(true, std::memory_order_release);
+    frame.pin_count.fetch_add(1, std::memory_order_acq_rel);
     return true;
 }
 
@@ -415,13 +439,145 @@ bool BufferPoolManager::unpin_page(PageId page_id) {
     }
     
     PageFrame& frame = frames_[it->second];
-    if (frame.pin_count > 0) {
-        frame.pin_count--;
+    if (frame.pin_count.load(std::memory_order_acquire) > 0) {
+        frame.pin_count.fetch_sub(1, std::memory_order_acq_rel);
     }
-    if (frame.pin_count == 0) {
-        frame.is_pinned = false;
+    if (frame.pin_count.load(std::memory_order_acquire) == 0) {
+        frame.is_pinned.store(false, std::memory_order_release);
     }
     return true;
+}
+
+void BufferPoolManager::unpin_all_pages(const std::vector<PageId>& pages) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    
+    for (PageId page_id : pages) {
+        auto it = page_table_.find(page_id);
+        if (it == page_table_.end()) {
+            continue;  // Page already evicted, skip
+        }
+        
+        PageFrame& frame = frames_[it->second];
+        if (frame.pin_count.load(std::memory_order_acquire) > 0) {
+            frame.pin_count.fetch_sub(1, std::memory_order_acq_rel);
+        }
+        if (frame.pin_count.load(std::memory_order_acquire) == 0) {
+            frame.is_pinned.store(false, std::memory_order_release);
+        }
+    }
+}
+
+char* BufferPoolManager::get_and_pin_page(NodeId node_id, PageId page_id) {
+    // Use shared_lock for cache hits — allows concurrent reads.
+    // Since pin_count and is_pinned are atomic, we can safely pin
+    // under a shared lock without risking data races with evict_page()
+    // (which uses unique_lock). The atomic increment ensures that
+    // evict_page() will see pin_count > 0 and skip this page.
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    
+    auto it = page_table_.find(page_id);
+    if (it == page_table_.end()) {
+        return nullptr;
+    }
+    
+    int frame_idx = it->second;
+    PageFrame& frame = frames_[frame_idx];
+    
+    // Update access statistics (non-atomic, but under shared_lock —
+    // concurrent updates may lose some counts, which is acceptable
+    // for statistics that don't affect correctness)
+    frame.access_count++;
+    frame.last_access_time = std::chrono::system_clock::now().time_since_epoch().count();
+    
+    // Notify eviction policy (has its own internal mutex)
+    eviction_policy_->on_access(page_id, frame.in_degree);
+    
+    // Atomic pin — prevents eviction between get and pin.
+    // Even under shared_lock, the atomic increment guarantees that
+    // evict_page() (under unique_lock) will see pin_count > 0.
+    frame.is_pinned.store(true, std::memory_order_release);
+    frame.pin_count.fetch_add(1, std::memory_order_acq_rel);
+    
+    hit_count_++;
+    return frame.data;
+}
+
+char* BufferPoolManager::get_or_load_and_pin_page(
+    NodeId node_id,
+    PageId page_id,
+    std::function<void(char* buffer, PageId page_id)> load_func
+) {
+    // Single write-lock acquisition for the entire operation.
+    // This matches the original get_or_load_page() pattern and avoids
+    // the "limbo frame" problem where a frame is removed from free_frames_
+    // but not yet in page_table_ during lock release.
+    //
+    // Trade-off: holding the lock during pread I/O blocks other threads
+    // from accessing the pool. However, pread is a single syscall (~μs),
+    // and the alternative (lock release + re-acquire + double-check) is
+    // complex and error-prone. The original get_or_load_page() also holds
+    // the lock during I/O, so this is consistent.
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    
+    // Check if page already exists (cache hit)
+    auto it = page_table_.find(page_id);
+    if (it != page_table_.end()) {
+        int frame_idx = it->second;
+        PageFrame& frame = frames_[frame_idx];
+        
+        frame.access_count++;
+        frame.last_access_time = std::chrono::system_clock::now().time_since_epoch().count();
+        eviction_policy_->on_access(page_id, frame.in_degree);
+        
+        // Pin atomically under the same lock (unique_lock, but use atomic for consistency)
+        frame.is_pinned.store(true, std::memory_order_release);
+        frame.pin_count.fetch_add(1, std::memory_order_acq_rel);
+        
+        hit_count_++;
+        return frame.data;
+    }
+    
+    // Cache miss: need to load page from disk
+    // Find a free frame
+    int frame_idx = find_free_frame();
+    if (frame_idx < 0) {
+        // Need to evict
+        if (!evict_page()) {
+            miss_count_++;
+            return nullptr;  // Buffer pool full
+        }
+        frame_idx = find_free_frame();
+    }
+    
+    // Allocate buffer if needed
+    PageFrame& frame = frames_[frame_idx];
+    if (!frame.data) {
+        frame.data = allocate_aligned_buffer(config_.page_size);
+    }
+    
+    // Load data from disk (pread syscall, ~μs latency)
+    load_func(frame.data, page_id);
+    
+    // Update frame metadata
+    frame.page_id = page_id;
+    frame.node_id = node_id;
+    frame.is_valid = true;
+    frame.is_dirty = false;
+    frame.access_count = 1;
+    frame.last_access_time = std::chrono::system_clock::now().time_since_epoch().count();
+    
+    // Pin the newly loaded page atomically under the same lock
+    frame.is_pinned.store(true, std::memory_order_release);
+    frame.pin_count.store(1, std::memory_order_release);
+    
+    // Add to page table
+    page_table_[page_id] = frame_idx;
+    
+    // Notify eviction policy
+    eviction_policy_->on_add(page_id, frame.in_degree);
+    
+    miss_count_++;
+    return frame.data;
 }
 
 void BufferPoolManager::mark_dirty(PageId page_id) {
@@ -439,7 +595,8 @@ Size BufferPoolManager::flush_dirty_pages(
     std::unique_lock<std::shared_mutex> lock(mutex_);
     
     Size count = 0;
-    for (auto& frame : frames_) {
+    for (Size i = 0; i < config_.max_pages; ++i) {
+        PageFrame& frame = frames_[i];
         if (frame.is_valid && frame.is_dirty && flush_func) {
             flush_func(frame.data, frame.page_id);
             frame.is_dirty = false;
@@ -486,6 +643,10 @@ Size BufferPoolManager::get_memory_usage() const {
     return size() * config_.page_size;
 }
 
+void BufferPoolManager::update_hub_threshold(const std::vector<uint32_t>& in_degrees) {
+    eviction_policy_->update_hub_threshold(in_degrees);
+}
+
 void BufferPoolManager::update_in_degree(NodeId node_id, uint32_t in_degree) {
     std::unique_lock<std::shared_mutex> lock(mutex_);
     
@@ -513,11 +674,12 @@ void BufferPoolManager::clear() {
     
     page_table_.clear();
     
-    for (auto& frame : frames_) {
+    for (Size i = 0; i < config_.max_pages; ++i) {
+        PageFrame& frame = frames_[i];
         frame.is_valid = false;
         frame.is_dirty = false;
-        frame.pin_count = 0;
-        frame.is_pinned = false;
+        frame.pin_count.store(0, std::memory_order_release);
+        frame.is_pinned.store(false, std::memory_order_release);
     }
     
     free_frames_.clear();
@@ -570,7 +732,7 @@ bool BufferPoolManager::evict_page(
     PageFrame& frame = frames_[frame_idx];
     
     // Don't evict pinned pages
-    if (frame.is_pinned) {
+    if (frame.is_pinned.load(std::memory_order_acquire)) {
         return false;
     }
     

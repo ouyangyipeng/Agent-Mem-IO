@@ -192,6 +192,24 @@ public:
         const std::vector<Vector>& vectors,
         GraphNavData& nav_data
     );
+    
+    /**
+     * @brief Search for nearest neighbors using greedy beam search
+     * @param query Query vector
+     * @param vectors Vector dataset
+     * @param nav_data Graph navigation data
+     * @param ef_search Search beam width
+     * @return List of (node_id, distance) pairs sorted by distance
+     *
+     * Public wrapper for search_for_construction(). Enables verification
+     * of the core/ search path without modifying the private API.
+     */
+    std::vector<Neighbor> search(
+        const Vector& query,
+        const std::vector<Vector>& vectors,
+        const GraphNavData& nav_data,
+        Size ef_search
+    );
 
 private:
     /**

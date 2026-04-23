@@ -203,7 +203,13 @@ struct SSTableMetadata {
     uint64_t creation_time;   // Creation timestamp
     std::string filepath;     // File path on SSD
     uint32_t level;           // Level in LSM tree
-    
+
+    // Bloom Filter for fast node_id membership testing
+    // Probabilistic: may return false positives, but never false negatives
+    std::vector<uint8_t> bloom_filter;  // Bit array
+    static constexpr Size BLOOM_FILTER_BITS = 1024;  // 128 bytes per SSTable
+    static constexpr Size BLOOM_FILTER_HASHES = 3;    // k=3 hash functions
+
     SSTableMetadata()
         : id(0)
         , min_node_id(INVALID_NODE_ID)
@@ -213,6 +219,53 @@ struct SSTableMetadata {
         , creation_time(0)
         , level(0)
     {}
+
+    /**
+     * @brief Build Bloom Filter from a list of node IDs
+     * @param node_ids List of node IDs that exist in this SSTable
+     * @return Bloom filter bit array
+     */
+    static std::vector<uint8_t> build_bloom_filter(const std::vector<NodeId>& node_ids) {
+        std::vector<uint8_t> filter(BLOOM_FILTER_BITS / 8, 0);
+        for (NodeId id : node_ids) {
+            Size h1 = bloom_hash1(id);
+            Size h2 = bloom_hash2(id);
+            Size h3 = bloom_hash3(id);
+            filter[h1 / 8] |= (1 << (h1 % 8));
+            filter[h2 / 8] |= (1 << (h2 % 8));
+            filter[h3 / 8] |= (1 << (h3 % 8));
+        }
+        return filter;
+    }
+
+    /**
+     * @brief Test whether a node_id might be in this SSTable
+     * @param filter Bloom filter bit array
+     * @param node_id Node ID to test
+     * @return true if node_id might be present (could be false positive),
+     *         false if node_id is definitely NOT present (never false negative)
+     */
+    static bool bloom_filter_test(const std::vector<uint8_t>& filter, NodeId node_id) {
+        if (filter.empty()) return true;  // No filter = assume present (safe fallback)
+
+        Size h1 = bloom_hash1(node_id);
+        Size h2 = bloom_hash2(node_id);
+        Size h3 = bloom_hash3(node_id);
+        return (filter[h1 / 8] & (1 << (h1 % 8))) &&
+               (filter[h2 / 8] & (1 << (h2 % 8))) &&
+               (filter[h3 / 8] & (1 << (h3 % 8)));
+    }
+
+    // Bloom filter hash functions (consistent between build and test)
+    static Size bloom_hash1(NodeId id) {
+        return static_cast<Size>(id) % BLOOM_FILTER_BITS;
+    }
+    static Size bloom_hash2(NodeId id) {
+        return (static_cast<Size>(id) * 31 + 7) % BLOOM_FILTER_BITS;
+    }
+    static Size bloom_hash3(NodeId id) {
+        return (static_cast<Size>(id) * 37 + 13) % BLOOM_FILTER_BITS;
+    }
 };
 
 /**
@@ -368,14 +421,19 @@ private:
  * @brief Compaction configuration
  */
 struct CompactionConfig {
+    enum Strategy { SIZE_TIERED, LEVEL_TIERED };
+
     uint32_t max_levels = 7;              // Maximum levels in LSM tree
     Size level_size_ratio = 10;           // Size ratio between levels
     Size min_sstables_to_compact = 2;     // Minimum SSTables to trigger compaction
+    Size size_tiered_threshold = 4;       // Merge when >= 4 SSTables of similar size
+    Size level_tiered_max_levels = 3;     // Number of levels for level-tiered
     uint32_t compaction_threads = 2;      // Number of compaction threads
     bool enable_background_compaction = true;  // Enable background compaction
     uint32_t compaction_interval_ms = 1000;    // Compaction check interval
     double io_bandwidth_limit = 0.5;      // I/O bandwidth limit (fraction of total)
-    
+    Strategy strategy = SIZE_TIERED;      // Default: Size-Tiered
+
     CompactionConfig() = default;
 };
 
@@ -466,19 +524,48 @@ private:
     void compaction_thread_func();
     
     /**
-     * @brief Compact SSTables in a level
+     * @brief Compact SSTables in a level (Size-Tiered strategy)
      * @param level Level to compact
      * @return Error status
      */
     Error compact_level(uint32_t level);
-    
+
+    /**
+     * @brief Compact SSTables using Level-Tiered strategy
+     *
+     * Level-Tiered: each level has a size ratio constraint.
+     * L0: no size limit (flush from MemTable)
+     * L1: level_size_ratio × L0 size
+     * L2: level_size_ratio × L1 size
+     * When a level exceeds its size limit, merge all SSTables
+     * in that level into the next level.
+     *
+     * @return Error status
+     */
+    Error compact_level_tiered();
+
+    /**
+     * @brief Compute maximum size allowed for a given level
+     * @param level Level number
+     * @return Maximum size in bytes for this level
+     */
+    Size compute_level_max_size(uint32_t level) const;
+
+    /**
+     * @brief Merge SSTables into the next level (for Level-Tiered)
+     * @param sstables SSTables to merge
+     * @param level Current level (output goes to level+1)
+     * @return Error status
+     */
+    Error merge_into_next_level(const std::vector<SSTableMetadata>& sstables, uint32_t level);
+
     /**
      * @brief Merge multiple SSTables
      * @param sstable_ids SSTable IDs to merge
      * @param output_id Output SSTable ID
      * @return Error status
      */
-    Error merge_sstables(const std::vector<uint64_t>& sstable_ids, 
+    Error merge_sstables(const std::vector<uint64_t>& sstable_ids,
                          uint64_t& output_id);
     
     /**

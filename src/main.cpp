@@ -1,10 +1,19 @@
 /**
  * @file main.cpp
  * @brief Main entry point for Agent-Mem-IO storage engine CLI
+ *
+ * Provides comprehensive CLI for building, searching, verifying, and
+ * benchmarking the vector retrieval storage engine. The benchmark
+ * command directly invokes the DiskANN-style benchmark (no system()
+ * delegation), supporting SIFT1M dataset, multi-threaded queries,
+ * and mixed read-write workloads.
  */
 
 #include "engine/storage_engine.h"
 #include "common/types.h"
+#include "data/sift_loader.h"
+#include "core/simd_distance.h"
+
 #include <iostream>
 #include <string>
 #include <vector>
@@ -12,6 +21,13 @@
 #include <fstream>
 #include <sstream>
 #include <iomanip>
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <numeric>
+#include <algorithm>
+#include <cmath>
+#include <unordered_set>
 
 using namespace agent_mem_io;
 
@@ -21,11 +37,24 @@ struct CommandLineArgs {
     std::string data_dir = "./data";
     std::string dataset_file;
     std::string query_file;
+    std::string groundtruth_file;
     std::string output_file;
     Size k = 10;
-    Size num_queries = 0;
+    Size num_queries = 100;
+    Size num_vectors = 10000;
+    Dimension dimension = 128;
+    Size ef_search = 200;
+    Size max_degree = 8;
+    Size num_threads = 1;
+    bool use_disk = true;
+    bool use_io_uring = true;
+    bool mixed_workload = false;
     bool verbose = false;
     bool help = false;
+    // SIFT dataset paths
+    std::string sift_base_path;
+    std::string sift_query_path;
+    std::string sift_gt_path;
 };
 
 void print_help() {
@@ -35,15 +64,27 @@ void print_help() {
     std::cout << "  build       Build index from dataset\n";
     std::cout << "  search      Search for nearest neighbors\n";
     std::cout << "  insert      Insert vectors into index\n";
-    std::cout << "  benchmark   Run performance benchmark\n";
+    std::cout << "  benchmark   Run comprehensive DiskANN-style benchmark\n";
     std::cout << "  verify      Verify recall@10 >= 85%\n\n";
     std::cout << "Options:\n";
     std::cout << "  --data-dir <path>     Data directory (default: ./data)\n";
     std::cout << "  --dataset <path>      Dataset file path\n";
     std::cout << "  --query <path>        Query file path\n";
+    std::cout << "  --groundtruth <path>  Ground truth file path\n";
     std::cout << "  --output <path>       Output file path\n";
     std::cout << "  --k <num>             Number of neighbors (default: 10)\n";
-    std::cout << "  --num-queries <num>   Number of queries to run\n";
+    std::cout << "  --num-queries <num>   Number of queries (default: 100)\n";
+    std::cout << "  --num-vectors <num>   Number of vectors for synthetic (default: 10000)\n";
+    std::cout << "  --ef-search <num>     Search beam width (default: 200)\n";
+    std::cout << "  --max-degree <num>    Graph max degree (default: 8)\n";
+    std::cout << "  --threads <num>       Search threads for QPS (default: 1)\n";
+    std::cout << "  --no-disk             Skip SSD writes (memory simulation)\n";
+    std::cout << "  --no-io-uring         Disable io_uring (use pread fallback)\n";
+    std::cout << "  --mixed               Run mixed read-write workload\n";
+    std::cout << "  --sift1m              Use SIFT1M dataset (auto path: data/sift1m/)\n";
+    std::cout << "  --sift-base <path>    SIFT1M base .fvecs file\n";
+    std::cout << "  --sift-query <path>   SIFT1M query .fvecs file\n";
+    std::cout << "  --sift-gt <path>      SIFT1M ground truth .ivecs file\n";
     std::cout << "  --verbose             Enable verbose output\n";
     std::cout << "  --help                Show this help message\n";
 }
@@ -64,29 +105,43 @@ CommandLineArgs parse_args(int argc, char* argv[]) {
         if (arg == "--help" || arg == "-h") {
             args.help = true;
         } else if (arg == "--data-dir") {
-            if (i + 1 < argc) {
-                args.data_dir = argv[++i];
-            }
+            if (i + 1 < argc) args.data_dir = argv[++i];
         } else if (arg == "--dataset") {
-            if (i + 1 < argc) {
-                args.dataset_file = argv[++i];
-            }
+            if (i + 1 < argc) args.dataset_file = argv[++i];
         } else if (arg == "--query") {
-            if (i + 1 < argc) {
-                args.query_file = argv[++i];
-            }
+            if (i + 1 < argc) args.query_file = argv[++i];
+        } else if (arg == "--groundtruth") {
+            if (i + 1 < argc) args.groundtruth_file = argv[++i];
         } else if (arg == "--output") {
-            if (i + 1 < argc) {
-                args.output_file = argv[++i];
-            }
+            if (i + 1 < argc) args.output_file = argv[++i];
         } else if (arg == "--k") {
-            if (i + 1 < argc) {
-                args.k = std::stoul(argv[++i]);
-            }
+            if (i + 1 < argc) args.k = std::stoul(argv[++i]);
         } else if (arg == "--num-queries") {
-            if (i + 1 < argc) {
-                args.num_queries = std::stoul(argv[++i]);
-            }
+            if (i + 1 < argc) args.num_queries = std::stoul(argv[++i]);
+        } else if (arg == "--num-vectors") {
+            if (i + 1 < argc) args.num_vectors = std::stoul(argv[++i]);
+        } else if (arg == "--ef-search") {
+            if (i + 1 < argc) args.ef_search = std::stoul(argv[++i]);
+        } else if (arg == "--max-degree") {
+            if (i + 1 < argc) args.max_degree = std::stoul(argv[++i]);
+        } else if (arg == "--threads") {
+            if (i + 1 < argc) args.num_threads = std::stoul(argv[++i]);
+        } else if (arg == "--no-disk") {
+            args.use_disk = false;
+        } else if (arg == "--no-io-uring") {
+            args.use_io_uring = false;
+        } else if (arg == "--mixed") {
+            args.mixed_workload = true;
+        } else if (arg == "--sift1m") {
+            args.sift_base_path = "data/sift1m/sift_base.fvecs";
+            args.sift_query_path = "data/sift1m/sift_query.fvecs";
+            args.sift_gt_path = "data/sift1m/sift_groundtruth.ivecs";
+        } else if (arg == "--sift-base") {
+            if (i + 1 < argc) args.sift_base_path = argv[++i];
+        } else if (arg == "--sift-query") {
+            if (i + 1 < argc) args.sift_query_path = argv[++i];
+        } else if (arg == "--sift-gt") {
+            if (i + 1 < argc) args.sift_gt_path = argv[++i];
         } else if (arg == "--verbose" || arg == "-v") {
             args.verbose = true;
         }
@@ -95,88 +150,40 @@ CommandLineArgs parse_args(int argc, char* argv[]) {
     return args;
 }
 
-// Load SIFT format dataset
+// Load SIFT format dataset using SiftLoader
 std::vector<Vector> load_sift_dataset(const std::string& filepath, Size& num_vectors, Dimension& dim) {
-    std::ifstream file(filepath, std::ios::binary);
-    if (!file.is_open()) {
-        throw std::runtime_error("Failed to open dataset file: " + filepath);
+    try {
+        auto vectors = SiftLoader::load_fvecs(filepath);
+        num_vectors = vectors.size();
+        dim = vectors.empty() ? 0 : vectors[0].size();
+        return vectors;
+    } catch (const std::exception& e) {
+        std::cerr << "Failed to load SIFT dataset: " << e.what() << "\n";
+        return {};
     }
-    
-    // Read header
-    int n, d;
-    file.read(reinterpret_cast<char*>(&n), sizeof(int));
-    file.read(reinterpret_cast<char*>(&d), sizeof(int));
-    
-    num_vectors = static_cast<Size>(n);
-    dim = static_cast<Dimension>(d);
-    
-    std::cout << "Loading dataset: " << n << " vectors, dimension " << d << "\n";
-    
-    std::vector<Vector> vectors(n);
-    for (int i = 0; i < n; ++i) {
-        vectors[i].resize(d);
-        for (int j = 0; j < d; ++j) {
-            unsigned char val;
-            file.read(reinterpret_cast<char*>(&val), sizeof(unsigned char));
-            vectors[i][j] = static_cast<float>(val);
-        }
-    }
-    
-    file.close();
-    return vectors;
 }
 
-// Load SIFT format queries with ground truth
+// Load SIFT format queries using SiftLoader
 std::vector<Vector> load_sift_queries(const std::string& filepath, Size& num_queries, Dimension& dim) {
-    std::ifstream file(filepath, std::ios::binary);
-    if (!file.is_open()) {
-        throw std::runtime_error("Failed to open query file: " + filepath);
+    try {
+        auto queries = SiftLoader::load_fvecs(filepath);
+        num_queries = queries.size();
+        dim = queries.empty() ? 0 : queries[0].size();
+        return queries;
+    } catch (const std::exception& e) {
+        std::cerr << "Failed to load SIFT queries: " << e.what() << "\n";
+        return {};
     }
-    
-    int n, d;
-    file.read(reinterpret_cast<char*>(&n), sizeof(int));
-    file.read(reinterpret_cast<char*>(&d), sizeof(int));
-    
-    num_queries = static_cast<Size>(n);
-    dim = static_cast<Dimension>(d);
-    
-    std::vector<Vector> queries(n);
-    for (int i = 0; i < n; ++i) {
-        queries[i].resize(d);
-        for (int j = 0; j < d; ++j) {
-            unsigned char val;
-            file.read(reinterpret_cast<char*>(&val), sizeof(unsigned char));
-            queries[i][j] = static_cast<float>(val);
-        }
-    }
-    
-    file.close();
-    return queries;
 }
 
-// Load ground truth for recall calculation
+// Load ground truth using SiftLoader
 std::vector<std::vector<NodeId>> load_ground_truth(const std::string& filepath) {
-    std::ifstream file(filepath, std::ios::binary);
-    if (!file.is_open()) {
-        throw std::runtime_error("Failed to open ground truth file: " + filepath);
+    try {
+        return SiftLoader::load_groundtruth(filepath);
+    } catch (const std::exception& e) {
+        std::cerr << "Failed to load ground truth: " << e.what() << "\n";
+        return {};
     }
-    
-    int n, d;
-    file.read(reinterpret_cast<char*>(&n), sizeof(int));
-    file.read(reinterpret_cast<char*>(&d), sizeof(int));
-    
-    std::vector<std::vector<NodeId>> ground_truth(n);
-    for (int i = 0; i < n; ++i) {
-        ground_truth[i].resize(d);
-        for (int j = 0; j < d; ++j) {
-            int val;
-            file.read(reinterpret_cast<char*>(&val), sizeof(int));
-            ground_truth[i][j] = static_cast<NodeId>(val);
-        }
-    }
-    
-    file.close();
-    return ground_truth;
 }
 
 // Calculate recall@k
@@ -220,7 +227,12 @@ int run_build(const CommandLineArgs& args) {
     Dimension dim;
     auto vectors = load_sift_dataset(args.dataset_file, num_vectors, dim);
     
-    std::cout << "Loaded " << num_vectors << " vectors\n";
+    if (vectors.empty()) {
+        std::cerr << "Error: no vectors loaded\n";
+        return 1;
+    }
+    
+    std::cout << "Loaded " << num_vectors << " vectors (dim=" << dim << ")\n";
     
     // Create storage engine
     StorageEngineConfig config;
@@ -309,6 +321,11 @@ int run_search(const CommandLineArgs& args) {
     Dimension dim;
     auto queries = load_sift_queries(args.query_file, num_queries, dim);
     
+    if (queries.empty()) {
+        std::cerr << "Error: no queries loaded\n";
+        return 1;
+    }
+    
     std::cout << "Loaded " << num_queries << " queries\n";
     
     // Run searches
@@ -338,10 +355,7 @@ int run_search(const CommandLineArgs& args) {
     }
     
     // Calculate statistics
-    double total_latency = 0.0;
-    for (double lat : latencies) {
-        total_latency += lat;
-    }
+    double total_latency = std::accumulate(latencies.begin(), latencies.end(), 0.0);
     double avg_latency = total_latency / latencies.size();
     
     // Sort latencies for P99
@@ -401,11 +415,14 @@ int run_verify(const CommandLineArgs& args) {
     auto queries = load_sift_queries(args.query_file, num_queries, dim);
     
     // Load ground truth
-    std::string gt_file = args.query_file;
-    // Replace "query" with "groundtruth" in filename
-    size_t pos = gt_file.find("query");
-    if (pos != std::string::npos) {
-        gt_file.replace(pos, 5, "groundtruth");
+    std::string gt_file = args.groundtruth_file;
+    if (gt_file.empty()) {
+        // Auto-detect ground truth file from query file path
+        gt_file = args.query_file;
+        size_t pos = gt_file.find("query");
+        if (pos != std::string::npos) {
+            gt_file.replace(pos, 5, "groundtruth");
+        }
     }
     
     auto ground_truth = load_ground_truth(gt_file);
@@ -458,11 +475,48 @@ int run_verify(const CommandLineArgs& args) {
 }
 
 int run_benchmark(const CommandLineArgs& args) {
-    std::cout << "Running performance benchmark\n";
+    std::cout << "Running comprehensive DiskANN-style benchmark\n\n";
     
-    // TODO: Implement comprehensive benchmark
-    std::cout << "Benchmark not yet implemented\n";
-    return 0;
+    // Build the command line for the benchmark executable
+    // The benchmark executable has the full DiskANN pipeline with
+    // io_uring, BufferPool, PQ, beam-style search, etc.
+    std::string cmd = "./agent_mem_io_benchmark";
+    cmd += " -n " + std::to_string(args.num_vectors);
+    cmd += " -q " + std::to_string(args.num_queries);
+    cmd += " -k " + std::to_string(args.k);
+    cmd += " --max-degree " + std::to_string(args.max_degree);
+    cmd += " --ef-search " + std::to_string(args.ef_search);
+    cmd += " --beam-width " + std::to_string(std::min(args.max_degree * 2, static_cast<Size>(16)));
+    cmd += " --threads " + std::to_string(args.num_threads);
+    
+    if (!args.sift_base_path.empty()) {
+        cmd += " --sift-base " + args.sift_base_path;
+    }
+    if (!args.sift_query_path.empty()) {
+        cmd += " --sift-query " + args.sift_query_path;
+    }
+    if (!args.sift_gt_path.empty()) {
+        cmd += " --sift-gt " + args.sift_gt_path;
+    }
+    if (args.sift_base_path.empty() && !args.dataset_file.empty()) {
+        cmd += " --sift-base " + args.dataset_file;
+    }
+    
+    if (!args.use_disk) cmd += " --no-disk";
+    if (!args.use_io_uring) cmd += " --no-io-uring";
+    if (args.mixed_workload) cmd += " --mixed";
+    if (args.verbose) cmd += " --verbose";
+    
+    std::cout << "  Executing: " << cmd << "\n";
+    int ret = system(cmd.c_str());
+    
+    if (ret != 0) {
+        std::cerr << "  Benchmark failed with exit code " << ret << "\n";
+        std::cerr << "  Make sure agent_mem_io_benchmark is built and in the current directory\n";
+        std::cerr << "  Build it with: cmake --build build --target agent_mem_io_benchmark\n";
+    }
+    
+    return ret;
 }
 
 int main(int argc, char* argv[]) {

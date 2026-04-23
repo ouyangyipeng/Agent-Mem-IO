@@ -7,7 +7,7 @@
  *   - 4KB-aligned O_DIRECT I/O (SSD-friendly, bypasses OS Page Cache)
  *   - Batch reads via preadv (multiple nodes in fewer syscalls)
  *   - Async batch reads via io_uring (CPU-I/O overlap for graph traversal)
- *   - LRU vector cache (reduce SSD reads for hot nodes)
+ *   - Graph-Aware 2Q BufferPool (reduce SSD reads for hub nodes)
  *   - Pre-allocated buffer pool (eliminate per-read alloc/dealloc overhead)
  */
 
@@ -19,12 +19,12 @@
 #include "buffer/buffer_pool.h"
 
 #include <vector>
-#include <list>
 #include <unordered_map>
 #include <string>
 #include <cstring>
 #include <algorithm>
 #include <memory>
+#include <mutex>
 
 namespace agent_mem_io {
 
@@ -38,11 +38,13 @@ constexpr Size DISK_RECORD_SIZE = 4096;
 /// Maximum graph degree stored on disk (room for 32 neighbors)
 constexpr Size DEFAULT_DISK_MAX_DEGREE = 32;
 
-/// Header size: node_id (4B) + 12B padding for SIMD alignment
-/// Vector data starts at offset 16 within each 4KB page, ensuring
-/// 16-byte alignment for SSE _mm_load_ps and 32-byte alignment
-/// relative to the page base (which is 4KB-aligned from O_DIRECT).
-constexpr Size DISK_RECORD_HEADER_SIZE = 16;
+/// Header size: node_id (4B) + 28B padding for full SIMD alignment
+/// Vector data starts at offset 32 within each 4KB page, ensuring
+/// 32-byte alignment for AVX2 _mm256_load_ps (4KB page base is
+/// aligned to 4096, and 4096+32 is 32-byte aligned). This enables
+/// aligned SIMD loads directly from BufferPool page buffers without
+/// memcpy, a key optimization for compute_distance_direct().
+constexpr Size DISK_RECORD_HEADER_SIZE = 32;
 
 /// Offset where vector data begins within a disk record
 /// This is aligned to 16 bytes for SIMD access directly from page buffer.
@@ -109,112 +111,6 @@ struct DiskNodeRecord {
              + sizeof(Size) + sizeof(NodeId) * DEFAULT_DISK_MAX_DEGREE
              + sizeof(PQCode) * DEFAULT_DISK_MAX_DEGREE * DEFAULT_PQ_M;
     }
-};
-
-// =============================================================================
-// VectorCache - LRU cache for SSD-resident vectors
-// =============================================================================
-
-/**
- * @brief LRU cache for node vectors read from SSD
- *
- * @deprecated Use BufferPoolManager with Graph-Aware 2Q eviction instead.
- * VectorCache is retained only for backward compatibility and simple
- * benchmarks that don't need graph-aware caching.
- *
- * Caches recently-accessed vectors to reduce SSD reads for hot nodes.
- * Memory usage is strictly controlled to fit within the 10-20% budget.
- *
- * Design: std::list (LRU order) + unordered_map (O(1) lookup)
- * Each entry stores the full DiskNodeRecord (vector + neighbor info),
- * so cached nodes can be fully processed without any SSD read.
- */
-class [[deprecated("Use BufferPoolManager with Graph-Aware 2Q instead")]] VectorCache {
-public:
-    /**
-     * @brief Construct vector cache with given capacity
-     * @param capacity Maximum number of entries (0 = disabled)
-     */
-    explicit VectorCache(Size capacity = 0);
-
-    /**
-     * @brief Check if a node is cached
-     * @param node_id Node ID
-     * @return true if cached
-     */
-    bool has(NodeId node_id) const;
-
-    /**
-     * @brief Get cached node record (no SSD read needed)
-     * @param node_id Node ID
-     * @return Pointer to cached record, nullptr if not cached
-     */
-    const DiskNodeRecord* get(NodeId node_id);
-
-    /**
-     * @brief Put a node record into cache
-     * @param node_id Node ID
-     * @param record Disk node record to cache
-     */
-    void put(NodeId node_id, const DiskNodeRecord& record);
-
-    /**
-     * @brief Clear all cache entries
-     */
-    void clear();
-
-    /**
-     * @brief Get number of cached entries
-     */
-    Size size() const { return map_.size(); }
-
-    /**
-     * @brief Get maximum capacity
-     */
-    Size capacity() const { return capacity_; }
-
-    /**
-     * @brief Set new capacity (evicts entries if over new limit)
-     */
-    void set_capacity(Size new_capacity);
-
-    /**
-     * @brief Get cache memory usage in bytes
-     * Each entry: DiskNodeRecord (~908 bytes) + hashmap overhead (~64 bytes)
-     */
-    Size memory_usage() const;
-
-    /**
-     * @brief Get cache hit count
-     */
-    uint64_t hit_count() const { return hits_; }
-
-    /**
-     * @brief Get cache miss count
-     */
-    uint64_t miss_count() const { return misses_; }
-
-    /**
-     * @brief Get cache hit rate
-     */
-    double hit_rate() const;
-
-    /// Memory per entry (DiskNodeRecord struct + hashmap overhead estimate)
-    static constexpr Size ENTRY_MEMORY = DiskNodeRecord::struct_size() + 64;
-
-private:
-    Size capacity_;
-    uint64_t hits_ = 0;
-    uint64_t misses_ = 0;
-
-    /// LRU list: front = most recently used, back = least recently used
-    std::list<NodeId> lru_;
-
-    /// Map: node_id -> (DiskNodeRecord, iterator into LRU list)
-    std::unordered_map<NodeId,
-        std::pair<DiskNodeRecord, std::list<NodeId>::iterator>> map_;
-
-    void evict_if_over_capacity();
 };
 
 // =============================================================================
@@ -437,8 +333,8 @@ public:
      * @brief Configure cache capacity using Graph-Aware 2Q BufferPoolManager
      * @param max_pages Maximum number of 4KB pages to cache (0 = disabled)
      *
-     * Replaces the old LRU VectorCache with BufferPoolManager using
-     * Graph-Aware 2Q eviction policy that protects high in-degree hub nodes.
+     * Uses BufferPoolManager with Graph-Aware 2Q eviction policy
+     * that protects high in-degree hub nodes from eviction.
      */
     void set_cache_capacity(Size max_pages);
 
@@ -451,6 +347,16 @@ public:
      * they stay cached for future queries.
      */
     void update_in_degrees(const std::vector<uint32_t>& in_degrees);
+
+    /**
+     * @brief Update the dynamic hub threshold for Graph-Aware 2Q eviction
+     * @param in_degrees In-degree distribution from the graph index
+     *
+     * Computes a percentile-based threshold from the in-degree distribution
+     * and updates the eviction policy. Nodes with in_degree >= threshold
+     * are classified as "hub nodes" and protected from eviction.
+     */
+    void update_buffer_pool_hub_threshold(const std::vector<uint32_t>& in_degrees);
 
     /**
      * @brief Check if a node is cached in the buffer pool
@@ -479,6 +385,58 @@ public:
      * @return L2 squared distance, or -1.0f on error
      */
     float compute_distance_direct(NodeId node_id, const Vector& query);
+
+    /**
+     * @brief Ensure a node's page is cached AND pinned (atomic load+pin)
+     *
+     * Critical for multi-threaded search: atomically loads the page into
+     * the BufferPool cache AND pins it under the same lock. This prevents
+     * the data race where a page could be evicted between loading and pinning.
+     *
+     * After this call, the page is guaranteed to remain cached until
+     * unpin_page() or unpin_all_pages() is called. This provides
+     * search-level pin protection: compute_distance_direct() internally
+     * does micro-level pin/unpin (pin_count goes 1→2→1), but the page
+     * stays pinned at pin_count=1 after micro-level unpin.
+     *
+     * @param node_id Node whose page to ensure is cached and pinned
+     * @return true if page is now cached and pinned
+     */
+    bool ensure_page_pinned(NodeId node_id);
+
+    /**
+     * @brief Pin a page in the buffer pool (prevent eviction during search)
+     *
+     * Forwarded to BufferPoolManager::pin_page(). Pinned pages cannot be
+     * evicted by the 2Q policy, ensuring they remain accessible during
+     * multi-threaded search. Must be paired with unpin_page() after use.
+     *
+     * @param node_id Node whose page to pin
+     * @return true if page was pinned (page must already be in cache)
+     */
+    bool pin_page(NodeId node_id);
+
+    /**
+     * @brief Unpin a page in the buffer pool (allow eviction again)
+     *
+     * Forwarded to BufferPoolManager::unpin_page(). Must be called after
+     * pin_page() when the page is no longer needed by the search.
+     *
+     * @param node_id Node whose page to unpin
+     * @return true if page was unpinned
+     */
+    bool unpin_page(NodeId node_id);
+
+    /**
+     * @brief Unpin all pages in a list (bulk operation, single lock)
+     *
+     * More efficient than calling unpin_page() individually for each page.
+     * Used at the end of diskann_search_enhanced() to release all pages
+     * pinned during a single search query.
+     *
+     * @param node_ids List of node IDs whose pages to unpin
+     */
+    void unpin_all_pages(const std::vector<NodeId>& node_ids);
 
     /**
      * @brief Batch compute L2 squared distances directly from BufferPool
@@ -536,9 +494,9 @@ public:
     void return_buffer(char* buffer);
 
     /**
-     * @brief Get buffer pool size
+     * @brief Get I/O buffer pool size (number of available temp buffers)
      */
-    Size get_buffer_pool_size() const { return buffer_pool_.size(); }
+    Size get_io_buffer_pool_size() const { return io_buffer_pool_.size(); }
 
     // --- Utility ---
 
@@ -566,31 +524,41 @@ private:
     std::string index_path_;
     int fd_;  // File descriptor (opened with O_DIRECT)
 
-    /// Graph-Aware 2Q buffer pool manager (replaces old LRU VectorCache)
-    /// Each 4KB page stores one node's full record (vector + graph + PQ).
-    /// Eviction uses 2Q algorithm with in-degree protection for hub nodes.
+    /// Graph-Aware 2Q page cache manager.
+    /// Caches SSD pages in RAM with eviction policy (2Q + in-degree protection).
+    /// Used for compute_distance_direct() and compute_distances_batch_direct().
     std::unique_ptr<BufferPoolManager> buffer_pool_mgr_;
 
-    /// Pre-allocated temp buffer pool for O_DIRECT reads (not for caching)
-    /// These are short-lived buffers used during read operations, returned after use.
-    std::vector<char*> buffer_pool_;
-    Size buffer_pool_capacity_ = 64;  // Default: 64 pre-allocated temp buffers
+    /// Pre-allocated temporary I/O buffer pool for async batch reads.
+    /// These are short-lived 4KB O_DIRECT-aligned buffers, borrowed for a single
+    /// read operation and returned after use. NOT a cache — no eviction policy.
+    /// Protected by io_buffer_pool_mutex_ for thread-safe borrow/return.
+    std::vector<char*> io_buffer_pool_;
+    std::mutex io_buffer_pool_mutex_;    // Protects io_buffer_pool_ for multi-threaded access
+    Size io_buffer_pool_capacity_ = 64;  // Default: 64 pre-allocated temp buffers
 
     /// IoEngine for async reads (io_uring when available, pread fallback)
     IoEngine* io_engine_ = nullptr;
+
+    /// io_uring fixed-buffer indices for registered io_buffer_pool_ entries
+    /// These are registered in set_io_engine() and unregistered in close()
+    std::vector<int> registered_buffer_indices_;
 
     /// Pending async read buffers (node_id -> aligned buffer)
     /// These buffers are allocated when submitting async reads and
     /// freed after parsing results in wait_async_batch()
     std::unordered_map<NodeId, char*> async_buffers_;
 
+    /// Mutex protecting async_buffers_ for multi-threaded io_uring access
+    std::mutex async_buffers_mutex_;
+
     /// Allocate a new aligned buffer (for pool initialization and growth)
     static char* alloc_aligned_buffer();
 
     /**
-     * @brief Initialize buffer pool with pre-allocated aligned buffers
+     * @brief Initialize I/O buffer pool with pre-allocated aligned buffers
      */
-    void init_buffer_pool(Size pool_size);
+    void init_io_buffer_pool(Size pool_size);
 };
 
 }  // namespace agent_mem_io

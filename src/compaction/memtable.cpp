@@ -202,13 +202,19 @@ Error SSTableManager::create_from_memtable(const MemTable& memtable, uint64_t& s
     meta.creation_time = std::chrono::system_clock::now().time_since_epoch().count();
     meta.level = 0;
     
-    // Find min/max node IDs
+    // Find min/max node IDs and collect node_ids for Bloom Filter
     meta.min_node_id = entries[0].node_id;
     meta.max_node_id = entries[0].node_id;
+    std::vector<NodeId> node_ids;
+    node_ids.reserve(entries.size());
     for (const auto& entry : entries) {
         meta.min_node_id = std::min(meta.min_node_id, entry.node_id);
         meta.max_node_id = std::max(meta.max_node_id, entry.node_id);
+        node_ids.push_back(entry.node_id);
     }
+
+    // Build Bloom Filter for fast membership testing
+    meta.bloom_filter = SSTableMetadata::build_bloom_filter(node_ids);
     
     // Create file path
     meta.filepath = data_dir_ + "/sstable_" + std::to_string(sstable_id) + ".bin";
@@ -220,7 +226,7 @@ Error SSTableManager::create_from_memtable(const MemTable& memtable, uint64_t& s
     }
     
     // Calculate size
-    meta.size_bytes = entries.size() * (sizeof(NodeId) + sizeof(uint32_t) + 
+    meta.size_bytes = entries.size() * (sizeof(NodeId) + sizeof(uint32_t) +
                                          DEFAULT_DIMENSION * sizeof(float) + sizeof(bool));
     
     // Store metadata
@@ -430,9 +436,18 @@ std::vector<SSTableMetadata> SSTableManager::get_sstables_containing(NodeId node
     
     std::vector<SSTableMetadata> result;
     for (const auto& pair : sstables_) {
-        if (node_id >= pair.second.min_node_id && node_id <= pair.second.max_node_id) {
-            result.push_back(pair.second);
+        const auto& meta = pair.second;
+        // Step 1: Range filter (fast, coarse)
+        if (node_id < meta.min_node_id || node_id > meta.max_node_id) {
+            continue;
         }
+        // Step 2: Bloom Filter (probabilistic, eliminates most false candidates)
+        if (!SSTableMetadata::bloom_filter_test(meta.bloom_filter, node_id)) {
+            continue;  // Definitely not in this SSTable
+        }
+        // Step 3: Passed both filters — include as candidate
+        // (May be false positive, but never false negative)
+        result.push_back(meta);
     }
     return result;
 }
@@ -563,13 +578,19 @@ uint64_t SSTableManager::create_from_entries(const std::vector<MemTableEntry>& e
     meta.creation_time = std::chrono::system_clock::now().time_since_epoch().count();
     meta.level = 0;
 
-    // Find min/max node IDs
+    // Find min/max node IDs and collect node_ids for Bloom Filter
     meta.min_node_id = entries[0].node_id;
     meta.max_node_id = entries[0].node_id;
+    std::vector<NodeId> node_ids;
+    node_ids.reserve(entries.size());
     for (const auto& entry : entries) {
         meta.min_node_id = std::min(meta.min_node_id, entry.node_id);
         meta.max_node_id = std::max(meta.max_node_id, entry.node_id);
+        node_ids.push_back(entry.node_id);
     }
+
+    // Build Bloom Filter for fast membership testing
+    meta.bloom_filter = SSTableMetadata::build_bloom_filter(node_ids);
 
     // Create file path
     meta.filepath = data_dir_ + "/sstable_" + std::to_string(sstable_id) + ".bin";

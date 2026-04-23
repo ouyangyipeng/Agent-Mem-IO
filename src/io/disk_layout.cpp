@@ -4,9 +4,10 @@
  *
  * Implements writing and reading 4KB-aligned node records for O_DIRECT SSD access.
  * Enhanced with:
- *   - VectorCache: LRU cache for hot nodes (reduces SSD reads 30-60%)
+ *   - BufferPoolManager: Graph-Aware 2Q eviction (hub node protection)
  *   - Buffer pool: pre-allocated aligned buffers (eliminates alloc/dealloc overhead)
  *   - Batch reads: preadv for multiple nodes in fewer syscalls
+ *   - io_uring fixed file registration for reduced syscall overhead
  */
 
 #include "io/disk_layout.h"
@@ -22,78 +23,6 @@
 #include <numeric>
 
 namespace agent_mem_io {
-
-// =============================================================================
-// VectorCache Implementation
-// =============================================================================
-
-VectorCache::VectorCache(Size capacity)
-    : capacity_(capacity) {
-}
-
-bool VectorCache::has(NodeId node_id) const {
-    return map_.find(node_id) != map_.end();
-}
-
-const DiskNodeRecord* VectorCache::get(NodeId node_id) {
-    auto it = map_.find(node_id);
-    if (it == map_.end()) {
-        misses_++;
-        return nullptr;
-    }
-
-    // Move to front of LRU list (most recently used)
-    lru_.splice(lru_.begin(), lru_, it->second.second);
-    hits_++;
-    return &(it->second.first);
-}
-
-void VectorCache::put(NodeId node_id, const DiskNodeRecord& record) {
-    if (capacity_ == 0) return;  // Cache disabled
-
-    auto it = map_.find(node_id);
-    if (it != map_.end()) {
-        // Already cached: update record and move to front
-        it->second.first = record;
-        lru_.splice(lru_.begin(), lru_, it->second.second);
-        return;
-    }
-
-    // New entry: add to front of LRU list
-    lru_.push_front(node_id);
-    map_.emplace(node_id, std::make_pair(record, lru_.begin()));
-
-    // Evict if over capacity
-    evict_if_over_capacity();
-}
-
-void VectorCache::clear() {
-    map_.clear();
-    lru_.clear();
-}
-
-void VectorCache::set_capacity(Size new_capacity) {
-    capacity_ = new_capacity;
-    evict_if_over_capacity();
-}
-
-Size VectorCache::memory_usage() const {
-    return map_.size() * ENTRY_MEMORY;
-}
-
-double VectorCache::hit_rate() const {
-    uint64_t total = hits_ + misses_;
-    return total > 0 ? static_cast<double>(hits_) / static_cast<double>(total) : 0.0;
-}
-
-void VectorCache::evict_if_over_capacity() {
-    while (capacity_ > 0 && map_.size() > capacity_) {
-        // Evict least recently used (back of LRU list)
-        NodeId evict_id = lru_.back();
-        lru_.pop_back();
-        map_.erase(evict_id);
-    }
-}
 
 // =============================================================================
 // DiskIndexWriter Implementation
@@ -120,10 +49,11 @@ void DiskIndexWriter::pack_record(const Vector& vector,
     // Zero the entire 4KB buffer first
     std::memset(buffer, 0, DISK_RECORD_SIZE);
 
-    // Write node ID at offset 0, then padding to 16 bytes
-    // This ensures vector data starts at offset 16 (SIMD-aligned within 4KB page)
+    // Write node ID at offset 0, then padding to 32 bytes
+    // This ensures vector data starts at offset 32 (AVX2-aligned within 4KB page:
+    // 4KB-aligned page base + 32 = 32-byte aligned for _mm256_load_ps)
     std::memcpy(buffer, &node_id, sizeof(NodeId));
-    // Padding bytes 4-15 are already zeroed by memset above
+    // Padding bytes 4-31 are already zeroed by memset above
 
     // Write full-precision vector at aligned offset 16
     Size offset = DISK_VECTOR_OFFSET;
@@ -242,11 +172,11 @@ DiskIndexReader::DiskIndexReader(const std::string& data_dir,
 
 DiskIndexReader::~DiskIndexReader() {
     close();
-    // Free all temp buffer pool entries
-    for (char* buf : buffer_pool_) {
+    // Free all temp I/O buffer pool entries
+    for (char* buf : io_buffer_pool_) {
         free(buf);
     }
-    buffer_pool_.clear();
+    io_buffer_pool_.clear();
 }
 
 bool DiskIndexReader::open() {
@@ -266,43 +196,55 @@ bool DiskIndexReader::open() {
 
     std::cout << "[DiskIndexReader] Index file opened successfully\n";
 
-    // Initialize buffer pool with pre-allocated aligned buffers
-    init_buffer_pool(buffer_pool_capacity_);
+    // Initialize I/O buffer pool with pre-allocated aligned buffers
+    init_io_buffer_pool(io_buffer_pool_capacity_);
 
     return true;
 }
 
 void DiskIndexReader::close() {
+    // Unregister io_uring fixed buffers before closing file
+    if (io_engine_ && !registered_buffer_indices_.empty()) {
+        for (int idx : registered_buffer_indices_) {
+            io_engine_->unregister_buffer(idx);
+        }
+        registered_buffer_indices_.clear();
+        std::cout << "[DiskIndexReader] Unregistered io_uring fixed buffers\n";
+    }
+
     if (fd_ >= 0) {
         ::close(fd_);
         fd_ = -1;
     }
 }
 
-void DiskIndexReader::init_buffer_pool(Size pool_size) {
+void DiskIndexReader::init_io_buffer_pool(Size pool_size) {
     for (Size i = 0; i < pool_size; ++i) {
         char* buf = alloc_aligned_buffer();
         if (buf) {
-            buffer_pool_.push_back(buf);
+            io_buffer_pool_.push_back(buf);
         }
     }
 }
 
 char* DiskIndexReader::borrow_buffer() {
-    if (!buffer_pool_.empty()) {
-        char* buf = buffer_pool_.back();
-        buffer_pool_.pop_back();
+    std::lock_guard<std::mutex> lock(io_buffer_pool_mutex_);
+    if (!io_buffer_pool_.empty()) {
+        char* buf = io_buffer_pool_.back();
+        io_buffer_pool_.pop_back();
         return buf;
     }
 
     // Pool exhausted: allocate a new buffer (will be returned to pool later)
+    // Note: alloc_aligned_buffer() is static and thread-safe (posix_memalign)
     char* buf = alloc_aligned_buffer();
     return buf;
 }
 
 void DiskIndexReader::return_buffer(char* buffer) {
     if (buffer) {
-        buffer_pool_.push_back(buffer);
+        std::lock_guard<std::mutex> lock(io_buffer_pool_mutex_);
+        io_buffer_pool_.push_back(buffer);
     }
 }
 
@@ -333,10 +275,10 @@ bool DiskIndexReader::read_node(NodeId node_id, char* buffer) {
 DiskNodeRecord DiskIndexReader::parse_record(const char* buffer) {
     DiskNodeRecord record;
 
-    // Read node ID at offset 0 (header is 16 bytes: 4B node_id + 12B padding)
+    // Read node ID at offset 0 (header is 32 bytes: 4B node_id + 28B padding)
     std::memcpy(&record.node_id, buffer, sizeof(NodeId));
 
-    // Read full-precision vector at aligned offset 16
+    // Read full-precision vector at aligned offset 32 (AVX2 32-byte aligned)
     std::memcpy(record.vector_data, buffer + DISK_VECTOR_OFFSET,
                 DEFAULT_DIMENSION * sizeof(float));
     Size offset = DISK_VECTOR_OFFSET + DEFAULT_DIMENSION * sizeof(float);
@@ -572,6 +514,17 @@ void DiskIndexReader::update_in_degrees(const std::vector<uint32_t>& in_degrees)
               << " nodes (Graph-Aware 2Q eviction enabled)\n";
 }
 
+void DiskIndexReader::update_buffer_pool_hub_threshold(
+    const std::vector<uint32_t>& in_degrees) {
+    if (!buffer_pool_mgr_) return;
+
+    // Compute dynamic hub threshold from in-degree distribution
+    // and update the eviction policy to protect hub nodes
+    buffer_pool_mgr_->update_hub_threshold(in_degrees);
+    std::cout << "[DiskIndexReader] Updated dynamic hub threshold for "
+              << "Graph-Aware 2Q eviction (hub nodes protected)\n";
+}
+
 bool DiskIndexReader::is_cached(NodeId node_id) const {
     if (!buffer_pool_mgr_) return false;
     return buffer_pool_mgr_->contains(node_id);
@@ -585,29 +538,41 @@ DiskNodeRecord DiskIndexReader::get_cached_record(NodeId node_id) {
 }
 
 float DiskIndexReader::compute_distance_direct(NodeId node_id, const Vector& query) {
-    // Fast path: page is cached in BufferPool → compute directly from page buffer
-    // Vector data is at DISK_VECTOR_OFFSET (16 bytes) within each 4KB-aligned page,
-    // which means it's 16-byte aligned relative to the page base.
-    // Since BufferPool pages are 4KB-aligned (from O_DIRECT), the vector data
-    // pointer is 16-byte aligned for SSE _mm_load_ps.
+    // Thread-safe distance computation using atomic get+pin pattern.
+    //
+    // CRITICAL: Under multi-threaded search, the old get_page() → SIMD → done
+    // sequence had a data race: get_page() releases the shared lock, then
+    // another thread's 2Q eviction could free the page buffer while SIMD is
+    // still reading from it. The atomic get_and_pin_page() / get_or_load_and_pin_page()
+    // acquire a write lock and pin the page before returning the pointer,
+    // guaranteeing the buffer remains valid throughout the SIMD computation.
+    //
+    // After computing the distance, we immediately unpin (micro-level unpin)
+    // so the page can be evicted again. The search-level pin (pinned_pages)
+    // in diskann_search_enhanced() provides longer-lived protection.
     if (buffer_pool_mgr_) {
-        char* page_data = buffer_pool_mgr_->get_page(node_id, node_id);
+        // Fast path: page is cached → get_and_pin atomically, compute, unpin
+        char* page_data = buffer_pool_mgr_->get_and_pin_page(node_id, node_id);
         if (page_data) {
-            // Direct SIMD distance from page buffer: skip parse_record memcpy!
             const float* vec_ptr = reinterpret_cast<const float*>(page_data + DISK_VECTOR_OFFSET);
-            return l2_distance_sq_simd(query.data(), vec_ptr, query.size());
+            float dist = l2_distance_sq_simd(query.data(), vec_ptr, query.size());
+            // Micro-level unpin: page is safe to evict again after SIMD read completes
+            buffer_pool_mgr_->unpin_page(node_id);
+            return dist;
         }
 
-        // Slow path: not cached → load page into BufferPool, then compute
+        // Slow path: not cached → load+pin atomically, compute, unpin
         auto load_func = [this](char* buffer, PageId pid) {
             Size offset = calculate_offset(static_cast<NodeId>(pid));
             ssize_t bytes_read = pread(fd_, buffer, DISK_RECORD_SIZE, offset);
             if (bytes_read != DISK_RECORD_SIZE) return;
         };
-        page_data = buffer_pool_mgr_->get_or_load_page(node_id, node_id, load_func);
+        page_data = buffer_pool_mgr_->get_or_load_and_pin_page(node_id, node_id, load_func);
         if (page_data) {
             const float* vec_ptr = reinterpret_cast<const float*>(page_data + DISK_VECTOR_OFFSET);
-            return l2_distance_sq_simd(query.data(), vec_ptr, query.size());
+            float dist = l2_distance_sq_simd(query.data(), vec_ptr, query.size());
+            buffer_pool_mgr_->unpin_page(node_id);
+            return dist;
         }
     }
 
@@ -615,6 +580,59 @@ float DiskIndexReader::compute_distance_direct(NodeId node_id, const Vector& que
     Vector vec = read_vector(node_id);
     if (vec.empty()) return -1.0f;
     return l2_distance_sq_simd(query.data(), vec.data(), query.size());
+}
+
+bool DiskIndexReader::ensure_page_pinned(NodeId node_id) {
+    if (!buffer_pool_mgr_) return false;
+
+    // Fast path: page is already cached → just pin it
+    if (buffer_pool_mgr_->pin_page(node_id)) {
+        return true;
+    }
+
+    // Slow path: page not in cache → load+pin atomically
+    // This ensures the page is in the cache AND pinned before we compute
+    // distance from it. Without this, compute_distance_direct() would
+    // load the page (micro-level pin/unpin), but another thread could
+    // evict it before our search-level pin_page() call.
+    auto load_func = [this](char* buffer, PageId pid) {
+        Size offset = calculate_offset(static_cast<NodeId>(pid));
+        ssize_t bytes_read = pread(fd_, buffer, DISK_RECORD_SIZE, offset);
+        if (bytes_read != DISK_RECORD_SIZE) return;
+    };
+    char* page_data = buffer_pool_mgr_->get_or_load_and_pin_page(node_id, node_id, load_func);
+    if (page_data) {
+        // get_or_load_and_pin_page already pinned it (pin_count=1).
+        // We want search-level pin (pin_count=2) so that after
+        // compute_distance_direct()'s micro-level unpin (pin_count→1),
+        // the page is still pinned at pin_count=1.
+        // But get_or_load_and_pin_page already set pin_count=1,
+        // and compute_distance_direct will do pin→2, compute, unpin→1.
+        // So the page stays at pin_count=1 after micro-level unpin. ✓
+        return true;
+    }
+
+    return false;
+}
+
+bool DiskIndexReader::pin_page(NodeId node_id) {
+    if (!buffer_pool_mgr_) return false;
+    return buffer_pool_mgr_->pin_page(node_id);
+}
+
+bool DiskIndexReader::unpin_page(NodeId node_id) {
+    if (!buffer_pool_mgr_) return false;
+    return buffer_pool_mgr_->unpin_page(node_id);
+}
+
+void DiskIndexReader::unpin_all_pages(const std::vector<NodeId>& node_ids) {
+    if (!buffer_pool_mgr_) return;
+    // Convert NodeId vector to PageId vector for BufferPoolManager
+    std::vector<PageId> page_ids(node_ids.size());
+    for (Size i = 0; i < node_ids.size(); ++i) {
+        page_ids[i] = static_cast<PageId>(node_ids[i]);
+    }
+    buffer_pool_mgr_->unpin_all_pages(page_ids);
 }
 
 Size DiskIndexReader::compute_distances_batch_direct(
@@ -637,46 +655,43 @@ Size DiskIndexReader::compute_distances_batch_direct(
         return success_count;
     }
 
-    // Phase 1: Check which pages are already cached
-    std::vector<bool> cached(node_ids.size(), false);
+    // Thread-safe batch distance computation using atomic get+pin+unpin pattern.
+    // Each distance computation: get_and_pin → SIMD → unpin (micro-level protection).
+    // This prevents the data race where another thread evicts the page between
+    // get_page() and the SIMD distance computation.
     for (Size i = 0; i < node_ids.size(); ++i) {
-        cached[i] = buffer_pool_mgr_->contains(node_ids[i]);
-    }
-
-    // Phase 2: Compute distances for cached pages (direct SIMD from buffer)
-    for (Size i = 0; i < node_ids.size(); ++i) {
-        if (cached[i]) {
-            char* page_data = buffer_pool_mgr_->get_page(node_ids[i], node_ids[i]);
-            if (page_data) {
-                // Software prefetch for next vector to improve cache utilization
-                if (i + 1 < node_ids.size() && cached[i + 1]) {
-                    char* next_page = buffer_pool_mgr_->get_page(node_ids[i + 1], node_ids[i + 1]);
-                    if (next_page) {
-                        __builtin_prefetch(next_page + DISK_VECTOR_OFFSET, 0, 1);
-                    }
+        // Software prefetch for next vector to improve cache utilization
+        if (i + 1 < node_ids.size()) {
+            if (buffer_pool_mgr_->contains(node_ids[i + 1])) {
+                char* next_page = buffer_pool_mgr_->get_page(node_ids[i + 1], node_ids[i + 1]);
+                if (next_page) {
+                    __builtin_prefetch(next_page + DISK_VECTOR_OFFSET, 0, 1);
                 }
-                const float* vec_ptr = reinterpret_cast<const float*>(page_data + DISK_VECTOR_OFFSET);
-                distances[i] = l2_distance_sq_simd(query.data(), vec_ptr, query.size());
-                success_count++;
             }
         }
-    }
 
-    // Phase 3: Load and compute for non-cached pages
-    for (Size i = 0; i < node_ids.size(); ++i) {
-        if (!cached[i] && distances[i] < 0.0f) {
-            char* page_data = nullptr;
-            auto load_func = [this](char* buffer, PageId pid) {
-                Size offset = calculate_offset(static_cast<NodeId>(pid));
-                ssize_t bytes_read = pread(fd_, buffer, DISK_RECORD_SIZE, offset);
-                if (bytes_read != DISK_RECORD_SIZE) return;
-            };
-            page_data = buffer_pool_mgr_->get_or_load_page(node_ids[i], node_ids[i], load_func);
-            if (page_data) {
-                const float* vec_ptr = reinterpret_cast<const float*>(page_data + DISK_VECTOR_OFFSET);
-                distances[i] = l2_distance_sq_simd(query.data(), vec_ptr, query.size());
-                success_count++;
-            }
+        // Fast path: cached → get_and_pin atomically, compute, unpin
+        char* page_data = buffer_pool_mgr_->get_and_pin_page(node_ids[i], node_ids[i]);
+        if (page_data) {
+            const float* vec_ptr = reinterpret_cast<const float*>(page_data + DISK_VECTOR_OFFSET);
+            distances[i] = l2_distance_sq_simd(query.data(), vec_ptr, query.size());
+            buffer_pool_mgr_->unpin_page(node_ids[i]);
+            success_count++;
+            continue;
+        }
+
+        // Slow path: not cached → load+pin atomically, compute, unpin
+        auto load_func = [this](char* buffer, PageId pid) {
+            Size offset = calculate_offset(static_cast<NodeId>(pid));
+            ssize_t bytes_read = pread(fd_, buffer, DISK_RECORD_SIZE, offset);
+            if (bytes_read != DISK_RECORD_SIZE) return;
+        };
+        page_data = buffer_pool_mgr_->get_or_load_and_pin_page(node_ids[i], node_ids[i], load_func);
+        if (page_data) {
+            const float* vec_ptr = reinterpret_cast<const float*>(page_data + DISK_VECTOR_OFFSET);
+            distances[i] = l2_distance_sq_simd(query.data(), vec_ptr, query.size());
+            buffer_pool_mgr_->unpin_page(node_ids[i]);
+            success_count++;
         }
     }
 
@@ -725,6 +740,39 @@ void DiskIndexReader::set_io_engine(IoEngine* io_engine) {
         std::cout << "[DiskIndexReader] IoEngine set (io_uring="
                   << (io_engine_->using_io_uring() ? "YES" : "NO (pread fallback)")
                   << ")\n";
+
+        // Register the index file fd with io_uring for fixed-file optimization
+        // This eliminates the per-submit syscall overhead of passing fd to the kernel
+        if (fd_ >= 0 && io_engine_->using_io_uring() && io_engine_->is_initialized()) {
+            int file_index = io_engine_->register_file(fd_);
+            if (file_index >= 0) {
+                std::cout << "[DiskIndexReader] Registered index file with io_uring "
+                          << "(fixed-file index=" << file_index << ")\n";
+            } else {
+                std::cout << "[DiskIndexReader] io_uring file registration failed "
+                          << "(will use regular fd submission)\n";
+            }
+        }
+
+        // Register pre-allocated I/O buffers with io_uring for fixed-buffer optimization
+        // This eliminates kernel copy overhead for O_DIRECT aligned buffers.
+        // io_buffer_pool_ is already populated by init_io_buffer_pool() in open(),
+        // so all buffers are available at this point.
+        if (io_engine_->using_io_uring() && io_engine_->is_initialized()) {
+            for (char* buf : io_buffer_pool_) {
+                int buf_index = io_engine_->register_buffer(buf, DISK_RECORD_SIZE);
+                if (buf_index >= 0) {
+                    registered_buffer_indices_.push_back(buf_index);
+                }
+            }
+            if (!registered_buffer_indices_.empty()) {
+                std::cout << "[DiskIndexReader] Registered " << registered_buffer_indices_.size()
+                          << " I/O buffers with io_uring (fixed-buffer optimization)\n";
+            } else {
+                std::cout << "[DiskIndexReader] io_uring buffer registration failed "
+                          << "(will use regular buffer submission)\n";
+            }
+        }
     }
 }
 
@@ -750,8 +798,11 @@ Size DiskIndexReader::submit_async_batch(const std::vector<NodeId>& node_ids) {
             if (!buffer) continue;
         }
 
-        // Store buffer mapping for later retrieval
-        async_buffers_[node_id] = buffer;
+        // Store buffer mapping for later retrieval (thread-safe)
+        {
+            std::lock_guard<std::mutex> lock(async_buffers_mutex_);
+            async_buffers_[node_id] = buffer;
+        }
 
         // Build IoRequest
         IoRequest req;
@@ -807,12 +858,43 @@ Size DiskIndexReader::wait_async_batch(const std::vector<NodeId>& node_ids,
     }
 
     // Phase 2: Wait for async completions and insert into buffer pool
-    if (io_engine_ && !async_buffers_.empty()) {
-        Size max_completions = async_buffers_.size();
+    // Thread-safe design: async_buffers_ protected by async_buffers_mutex_.
+    // Lock ordering constraint: never hold async_buffers_mutex_ while calling
+    // return_buffer() (which takes io_buffer_pool_mutex_), to avoid deadlock.
+    // In multi-threaded mode, we may reap completions submitted by other threads.
+    // We insert ALL completed data into buffer_pool (shared, thread-safe) so
+    // any thread can find it via cache hit later, even if the completion was
+    // for a node_id not in our own node_ids list.
+    Size max_completions = 0;
+    {
+        std::lock_guard<std::mutex> lock(async_buffers_mutex_);
+        if (io_engine_ && !async_buffers_.empty()) {
+            max_completions = async_buffers_.size();
+        }
+    }
+
+    if (max_completions > 0) {
         auto completions = io_engine_->wait_completion_batch(max_completions, 100);
+
+        // Collect buffers to return AFTER processing (outside async_buffers_mutex_)
+        std::vector<char*> processed_buffers;
 
         for (const auto& comp : completions) {
             if (comp.success() && comp.node_id != INVALID_NODE_ID) {
+                // Extract buffer from async_buffers_ under lock
+                char* comp_buffer = nullptr;
+                {
+                    std::lock_guard<std::mutex> lock(async_buffers_mutex_);
+                    auto buf_it = async_buffers_.find(comp.node_id);
+                    if (buf_it != async_buffers_.end()) {
+                        comp_buffer = buf_it->second;
+                        async_buffers_.erase(buf_it);
+                    }
+                }
+
+                if (!comp_buffer) continue;
+
+                // Find index in our node_ids (may be -1 for another thread's completion)
                 Size idx = static_cast<Size>(-1);
                 for (Size j = 0; j < node_ids.size(); ++j) {
                     if (node_ids[j] == comp.node_id) {
@@ -821,13 +903,15 @@ Size DiskIndexReader::wait_async_batch(const std::vector<NodeId>& node_ids,
                     }
                 }
 
-                auto buf_it = async_buffers_.find(comp.node_id);
-                if (buf_it != async_buffers_.end() && idx != static_cast<Size>(-1)) {
-                    // Insert async read result into buffer pool (direct data insertion)
-                    if (buffer_pool_mgr_) {
-                        buffer_pool_mgr_->put_page_data(comp.node_id, comp.node_id,
-                                                         buf_it->second, DISK_RECORD_SIZE);
-                        // Re-read from buffer pool to get parsed result
+                // ALWAYS insert into buffer_pool (shared cache, helps all threads)
+                // This is critical for multi-threaded io_uring: when Thread A reaps
+                // Thread B's completions, inserting into buffer_pool ensures Thread B
+                // can find the data via cache hit in Phase 1 or Phase 3.
+                if (buffer_pool_mgr_) {
+                    buffer_pool_mgr_->put_page_data(comp.node_id, comp.node_id,
+                                                     comp_buffer, DISK_RECORD_SIZE);
+                    // Only populate output_vectors for our own node_ids
+                    if (idx != static_cast<Size>(-1)) {
                         char* cached_data = buffer_pool_mgr_->get_page(comp.node_id, comp.node_id);
                         if (cached_data) {
                             DiskNodeRecord record = parse_record(cached_data);
@@ -836,16 +920,23 @@ Size DiskIndexReader::wait_async_batch(const std::vector<NodeId>& node_ids,
                                         DEFAULT_DIMENSION * sizeof(float));
                             success_count++;
                         }
-                    } else {
-                        // No buffer pool: parse directly
-                        DiskNodeRecord record = parse_record(buf_it->second);
-                        output_vectors[idx].resize(DEFAULT_DIMENSION);
-                        std::memcpy(output_vectors[idx].data(), record.vector_data,
-                                    DEFAULT_DIMENSION * sizeof(float));
-                        success_count++;
                     }
+                } else if (idx != static_cast<Size>(-1)) {
+                    // No buffer pool: only parse for our own nodes
+                    DiskNodeRecord record = parse_record(comp_buffer);
+                    output_vectors[idx].resize(DEFAULT_DIMENSION);
+                    std::memcpy(output_vectors[idx].data(), record.vector_data,
+                                DEFAULT_DIMENSION * sizeof(float));
+                    success_count++;
                 }
+
+                processed_buffers.push_back(comp_buffer);
             }
+        }
+
+        // Return processed temp buffers to pool (outside async_buffers_mutex_)
+        for (char* buf : processed_buffers) {
+            return_buffer(buf);
         }
     }
 
@@ -892,11 +983,21 @@ Size DiskIndexReader::wait_async_batch(const std::vector<NodeId>& node_ids,
         }
     }
 
-    // Free all async buffers (they're now in buffer pool, temp buffers can be recycled)
-    for (auto& [node_id, buffer] : async_buffers_) {
-        return_buffer(buffer);
+    // Free remaining async buffers (completions not received — timed out or failed)
+    // These are entries still in async_buffers_ after Phase 2 processing.
+    // Lock protects async_buffers_ access; return_buffer() is called outside lock
+    // to avoid deadlock (return_buffer takes io_buffer_pool_mutex_).
+    std::vector<char*> remaining_buffers;
+    {
+        std::lock_guard<std::mutex> lock(async_buffers_mutex_);
+        for (auto& [node_id, buffer] : async_buffers_) {
+            remaining_buffers.push_back(buffer);
+        }
+        async_buffers_.clear();
     }
-    async_buffers_.clear();
+    for (char* buf : remaining_buffers) {
+        return_buffer(buf);
+    }
 
     return success_count;
 }

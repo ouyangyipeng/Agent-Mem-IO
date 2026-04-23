@@ -254,4 +254,100 @@
 
 ---
 
+## 8. V4审计修复记录 (2026-04-23)
+
+### P0-2+P0-4: README诚实展示SSD QPS + 内存路径标注违规
+
+**问题**：README性能指标表只展示内存模式QPS（1961/12887/770/335），隐藏了SSD+io_uring模式QPS。内存模式QPS违反赛题"内存≤20%"约束（实际内存比例100%）。赛题核心场景是SSD+受限内存，但核心场景性能被选择性隐藏。
+
+**修复措施**：
+1. 运行SSD基准测试获取真实QPS数据：
+   - SIFT 10K SSD 1线程: QPS=6.12, Recall=98.90%, Memory=20.0%, Cache=66.8%
+   - SIFT 10K SSD 4线程: QPS=10.10, Recall=98.90%, Memory=20.0%, Cache=0.3%
+   - SIFT 100K SSD 1线程: QPS=4.85, Recall=99.60%, Memory=20.0%, Cache=66.8%
+   - SIFT 1M SSD 1线程: QPS=5.99, Recall=98.30%, Memory=20.0%, Cache=67.0%
+2. README性能指标表改为双轨展示：
+   - SSD模式在前（赛题核心场景），标注合规✅
+   - 内存模式在后，标注"⚠️违反≤20%约束，仅供参考"
+3. 添加双轨搜索路径Trade-off说明
+4. 更新所有文档中旧数据引用（41.2%→66.8%, 99.30%→98.90%）
+
+**诚信原则**：
+- SSD QPS虽低（6.12/10.10/4.85），但必须诚实展示
+- 内存模式QPS虽高，但必须标注违规
+- 不隐藏任何数据，无论QPS高低
+
+---
+
+### V4审计修复：Subtask-3 (P1-2+P1-3+P1-4+P1-5)
+
+**日期**: 2026-04-23
+
+**问题**: V4审计报告指出4个相关问题：
+- P1-2: benchmark使用自定义FlatGraphIndex，core/GraphIndex未被验证
+- P1-3: StorageEngine的QueryProcessor在benchmark中未被调用
+- P1-4: 混合负载LSM写入不更新图索引
+- P1-5: 无多线程搜索或search_memory_fast的测试覆盖
+
+**设计决策**：
+- 不替换benchmark的FlatGraphIndex（性能优化的关键），而是添加桥接验证层
+- 构建完成后将FlatGraphIndex转换为GraphNavData，运行验证查询确认core/搜索路径可用
+- 混合负载中LSM写入的向量同时通过add_node_incremental()插入GraphNavData
+- 新增3个测试覆盖增量插入、search_memory_fast组件、多线程BufferPool安全性
+
+**修改文件**：
+1. `src/core/graph_index.h` — 添加VamanaBuilder::search() public方法
+2. `src/core/graph_index.cpp` — 实现search()（委托给search_for_construction）+ 修复build()中硬编码DEFAULT_DIMENSION的bug
+3. `src/benchmark.cpp` — 添加convert_to_nav_data()转换函数、Step 4.5验证步骤、run_mixed_workload增量图插入
+4. `tests/test_main.cpp` — 新增3个测试函数
+
+**Bug修复**：
+- VamanaBuilder::build()中centroid使用DEFAULT_DIMENSION(128)而非实际向量维度，导致非128维数据构建时崩溃。改为使用vectors[0].size()。
+
+**测试结果**：所有17个测试PASSED（含3个新增测试）
+
+---
+
+### V6.1综合性能优化：io_uring线程安全 + PQ ADC阈值 + entry point pinning
+
+**日期**: 2026-04-23
+
+**问题**: V5/V6审计发现3个问题：
+1. V5-Minor-1: README SSD QPS数据需更新（6.12→实测7.62+）
+2. V5-Minor-2: 4线程缓存命中率0.2%（vs 单线程66.8%），多线程竞争小缓存
+3. V6-NEW-1: 多线程SSD搜索禁用io_uring（async_buffers_线程不安全）
+
+**设计决策**：
+- io_uring async_buffers_添加mutex保护（安全修复），但多线程仍传nullptr给io_engine
+  - 原因：共享io_uring ring导致completion stealing，实测4线程QPS从9.25→0.90
+  - mutex是安全措施（防止数据竞争），但共享ring性能是灾难性的
+  - 多线程I/O并行性来自并发同步读取（BufferPoolManager线程安全）
+- PQ ADC阈值截断：当results.size()>=k时，截断PQ距离>worst_dist×4.0的候选
+  - 减少不必要的SSD读取，单线程QPS从6.48→7.62（+17%）
+- Entry point pinning：搜索前pin entry point，搜索后unpin
+  - 保护最关键节点不被淘汰，仅1页不会导致cache lock
+- beam_width保持8：实测beam_width=16对10K数据集QPS更低（5.10 vs 6.48）
+
+**修改文件**：
+1. `src/io/disk_layout.h` — 添加`std::mutex async_buffers_mutex_`保护async_buffers_
+2. `src/io/disk_layout.cpp` — submit_async_batch()加锁、wait_async_batch()细粒度加锁（避免死锁）
+3. `src/benchmark.cpp` — PQ ADC阈值截断、entry point pinning、多线程注释更新
+4. `README.md` — SSD QPS更新为实测值（7.62/9.25/5.38）
+5. `PROGRESS.md` — QPS追踪表更新
+6. `docs/REPORT.md` — 性能数据更新
+7. `docs/PAPER.md` — 性能对比表更新
+
+**实测结果**：
+- SIFT 10K 1线程: QPS=7.62 (↑24% vs 6.12), Recall=98.90%, Cache=66.7%
+- SIFT 10K 4线程: QPS=9.25 (↓8% vs 10.10, 但更诚实), Recall=98.90%, Cache=0.3%
+- SIFT 100K 1线程: QPS=5.38 (↑11% vs 4.85), Recall=99.60%, Cache=66.9%
+- 所有测试PASSED，Memory=20.0% PASS
+
+**教训**：
+- 共享io_uring ring在多线程下性能灾难（completion stealing），mutex只解决安全不解决性能
+- beam_width不是越大越好，小数据集beam_width=8更优（减少SSD读取量）
+- PQ ADC阈值截断是真实有效的QPS优化（减少不必要的SSD读取）
+
+---
+
 *本文档将随着项目进展持续更新。*

@@ -458,6 +458,36 @@ public:
      */
     bool is_initialized() const;
 
+    /**
+     * @brief Register file descriptor for io_uring fixed-file support
+     * @param fd File descriptor to register
+     * @return Index of registered file, or -1 on error / if io_uring not available
+     *
+     * When io_uring is available, this registers the fd with the kernel
+     * so that subsequent I/O submissions can use fixed-file references
+     * instead of passing the fd each time, reducing per-submit syscall overhead.
+     */
+    int register_file(int fd);
+
+    /**
+     * @brief Register a buffer with io_uring for fixed-buffer optimization
+     * @param buffer Aligned buffer pointer (must remain valid while registered)
+     * @param size Buffer size
+     * @return Buffer index (>=0 on success, -1 on failure or no io_uring)
+     *
+     * When io_uring is available, this registers the buffer with the kernel
+     * so that subsequent I/O submissions can use fixed-buffer references,
+     * eliminating kernel copy overhead for O_DIRECT aligned buffers.
+     */
+    int register_buffer(char* buffer, Size size);
+
+    /**
+     * @brief Unregister a previously registered buffer
+     * @param index Buffer index from register_buffer
+     * @return Error status
+     */
+    Error unregister_buffer(int index);
+
 private:
 #if USE_IOURING
     std::unique_ptr<IoUringEngine> io_uring_engine_;

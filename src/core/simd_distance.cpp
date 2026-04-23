@@ -90,12 +90,31 @@ float l2_distance_sq_avx2(const float* a, const float* b, uint32_t dim) {
 
     uint32_t i = 0;
     const uint32_t main_end = dim - (dim % 8);
-    for (; i < main_end; i += 8) {
-        __m256 a_vec = _mm256_loadu_ps(a + i);
-        __m256 b_vec = _mm256_loadu_ps(b + i);
-        __m256 diff = _mm256_sub_ps(a_vec, b_vec);
-        __m256 sq = _mm256_mul_ps(diff, diff);
-        sum_vec = _mm256_add_ps(sum_vec, sq);
+
+    // When pointers are 32-byte aligned (guaranteed by 4KB page layout with
+    // DISK_RECORD_HEADER_SIZE=32), use aligned loads for better throughput.
+    // _mm256_load_ps requires 32-byte alignment; _mm256_loadu_ps works for any alignment.
+    // DiskIndexReader page buffers are 4KB-aligned, and vector data starts at offset 32,
+    // so (page_base + 32) is always 32-byte aligned → safe for _mm256_load_ps.
+    bool a_aligned = ((reinterpret_cast<uintptr_t>(a) & 0x1F) == 0);
+    bool b_aligned = ((reinterpret_cast<uintptr_t>(b) & 0x1F) == 0);
+
+    if (a_aligned && b_aligned) {
+        for (; i < main_end; i += 8) {
+            __m256 a_vec = _mm256_load_ps(a + i);   // Aligned load (32B boundary)
+            __m256 b_vec = _mm256_load_ps(b + i);
+            __m256 diff = _mm256_sub_ps(a_vec, b_vec);
+            __m256 sq = _mm256_mul_ps(diff, diff);
+            sum_vec = _mm256_add_ps(sum_vec, sq);
+        }
+    } else {
+        for (; i < main_end; i += 8) {
+            __m256 a_vec = _mm256_loadu_ps(a + i);  // Unaligned load (safe fallback)
+            __m256 b_vec = _mm256_loadu_ps(b + i);
+            __m256 diff = _mm256_sub_ps(a_vec, b_vec);
+            __m256 sq = _mm256_mul_ps(diff, diff);
+            sum_vec = _mm256_add_ps(sum_vec, sq);
+        }
     }
 
     // Horizontal reduction
@@ -135,12 +154,29 @@ float l2_distance_sq_sse(const float* a, const float* b, uint32_t dim) {
 
     uint32_t i = 0;
     const uint32_t main_end = dim - (dim % 4);
-    for (; i < main_end; i += 4) {
-        __m128 a_vec = _mm_loadu_ps(a + i);
-        __m128 b_vec = _mm_loadu_ps(b + i);
-        __m128 diff = _mm_sub_ps(a_vec, b_vec);
-        __m128 sq = _mm_mul_ps(diff, diff);
-        sum_vec = _mm_add_ps(sum_vec, sq);
+
+    // Use aligned loads when pointers are 16-byte aligned.
+    // DiskIndexReader page buffers guarantee this: 4KB-aligned base + offset 32
+    // → vector data pointer is 32-byte aligned (also 16-byte aligned for SSE).
+    bool a_aligned = ((reinterpret_cast<uintptr_t>(a) & 0xF) == 0);
+    bool b_aligned = ((reinterpret_cast<uintptr_t>(b) & 0xF) == 0);
+
+    if (a_aligned && b_aligned) {
+        for (; i < main_end; i += 4) {
+            __m128 a_vec = _mm_load_ps(a + i);   // Aligned load (16B boundary)
+            __m128 b_vec = _mm_load_ps(b + i);
+            __m128 diff = _mm_sub_ps(a_vec, b_vec);
+            __m128 sq = _mm_mul_ps(diff, diff);
+            sum_vec = _mm_add_ps(sum_vec, sq);
+        }
+    } else {
+        for (; i < main_end; i += 4) {
+            __m128 a_vec = _mm_loadu_ps(a + i);  // Unaligned load (safe fallback)
+            __m128 b_vec = _mm_loadu_ps(b + i);
+            __m128 diff = _mm_sub_ps(a_vec, b_vec);
+            __m128 sq = _mm_mul_ps(diff, diff);
+            sum_vec = _mm_add_ps(sum_vec, sq);
+        }
     }
 
     // Horizontal reduction
@@ -191,7 +227,26 @@ float l2_distance_simd(const float* a, const float* b, uint32_t dim) {
 void batch_l2_distance_sq_simd(const float* query, const float* database,
                                 uint32_t num_vectors, uint32_t dim,
                                 float* distances) {
-    for (uint32_t i = 0; i < num_vectors; ++i) {
+    // Optimized batch: software prefetch + loop unroll for better cache utilization.
+    // Prefetching the next vector while computing the current one hides L2 cache latency.
+    const uint32_t UNROLL = 4;  // Process 4 vectors per iteration
+    uint32_t i = 0;
+    const uint32_t unroll_end = num_vectors - (num_vectors % UNROLL);
+
+    for (; i < unroll_end; i += UNROLL) {
+        // Software prefetch next group of vectors into L2 cache
+        if (i + UNROLL < num_vectors) {
+            __builtin_prefetch(database + (i + UNROLL) * dim, 0, 1);
+        }
+        // Compute distances for current group
+        distances[i]     = l2_distance_sq_simd(query, database + i * dim, dim);
+        distances[i + 1] = l2_distance_sq_simd(query, database + (i + 1) * dim, dim);
+        distances[i + 2] = l2_distance_sq_simd(query, database + (i + 2) * dim, dim);
+        distances[i + 3] = l2_distance_sq_simd(query, database + (i + 3) * dim, dim);
+    }
+
+    // Handle remaining vectors
+    for (; i < num_vectors; ++i) {
         distances[i] = l2_distance_sq_simd(query, database + i * dim, dim);
     }
 }

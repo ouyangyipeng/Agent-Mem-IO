@@ -4,11 +4,15 @@
  */
 
 #include "engine/storage_engine.h"
+#include "io/disk_layout.h"
 #include "data/sift_loader.h"
+#include "core/simd_distance.h"
+#include "core/visited_bitmap.h"
 #include <iostream>
 #include <fstream>
 #include <sys/stat.h>
 #include <cstring>
+#include <algorithm>
 
 namespace agent_mem_io {
 
@@ -41,25 +45,28 @@ QueryProcessor::QueryProcessor(
     BufferPoolManager* buffer_pool,
     IoEngine* io_engine,
     TopologyAwarePrefetcher* prefetcher,
-    int vector_fd
+    int vector_fd,
+    DiskIndexReader* disk_reader
 )
     : graph_index_(graph_index)
     , buffer_pool_(buffer_pool)
     , io_engine_(io_engine)
     , prefetcher_(prefetcher)
+    , disk_reader_(disk_reader)
     , vector_fd_(vector_fd)
 {
 }
 
 Error QueryProcessor::search(const Vector& query, Size k, SearchResults& results) {
-    // Use default beam width of 16 for search
-    return search_with_beam_width(query, k, 16, results);
+    // Use default ef_search=350 (matches benchmark default for Recall≥85%)
+    return search_with_beam_width(query, k, 16, 350, results);
 }
 
 Error QueryProcessor::search_with_beam_width(
     const Vector& query,
     Size k,
     Size beam_width,
+    Size ef_search,
     SearchResults& results
 ) {
     if (!graph_index_) {
@@ -71,88 +78,97 @@ Error QueryProcessor::search_with_beam_width(
         return Error::invalid_argument("Graph index has no entry point");
     }
     
-    // Priority queue for candidates (min heap by distance)
-    std::priority_queue<Neighbor, std::vector<Neighbor>, std::greater<Neighbor>> candidates;
+    Size num_nodes = graph_index_->get_num_nodes();
     
-    // Max heap for results (keep top k)
-    std::priority_queue<Neighbor, std::vector<Neighbor>, std::less<Neighbor>> result_heap;
+    // VisitedBitmap: ~10x faster than std::unordered_set for large datasets
+    VisitedBitmap visited(num_nodes);
     
-    // Visited set
-    std::unordered_set<NodeId> visited;
+    // Min-heap for candidates (closest first) — standard DiskANN/Vamana search
+    std::priority_queue<std::pair<float, NodeId>,
+                       std::vector<std::pair<float, NodeId>>,
+                       std::greater<>> candidates;
     
-    // Start from entry point
-    Distance entry_dist = calculate_distance(query, entry);
-    candidates.emplace(entry, entry_dist);
-    result_heap.emplace(entry, entry_dist);
-    visited.insert(entry);
+    // Max-heap for results (furthest first, for easy eviction)
+    std::priority_queue<std::pair<float, NodeId>> result_heap;
     
-    // Search loop
+    // Start from entry point — use compute_distance_direct when available
+    // (skips parse_record memcpy, computes SIMD distance directly from
+    // 4KB-aligned BufferPool page buffer)
+    float entry_dist;
+    if (disk_reader_ && disk_reader_->is_open()) {
+        entry_dist = disk_reader_->compute_distance_direct(entry, query);
+        if (entry_dist < 0.0f) {
+            // Fallback: read_vector + manual distance
+            Vector entry_vec = disk_reader_->read_vector(entry);
+            entry_dist = l2_distance_sq_simd(query.data(), entry_vec.data(), query.size());
+        }
+    } else {
+        entry_dist = static_cast<float>(calculate_distance(query, entry));
+    }
+    candidates.push({entry_dist, entry});
+    result_heap.push({entry_dist, entry});
+    visited.set(entry);
+    
+    // DiskANN-style greedy search with ef_search control
     while (!candidates.empty()) {
-        auto [current_id, current_dist] = candidates.top();
+        auto [current_dist, current_id] = candidates.top();
         candidates.pop();
         
-        // Prune if we have enough results and current is worse than worst result
-        if (result_heap.size() >= k && current_dist > result_heap.top().second) {
-            break;
-        }
+        // Early termination: if best remaining candidate is worse than
+        // worst result AND we have enough results (ef_search reached)
+        float fd = result_heap.top().first;
+        if (current_dist > fd && result_heap.size() >= ef_search) break;
         
-        // Prefetch neighbors
+        // Prefetch neighbors (topology-aware async I/O)
         if (prefetcher_) {
             prefetcher_->prefetch_neighbors(current_id, vector_fd_);
         }
         
-        // Get current vector
-        Vector current_vec;
-        Error err = get_vector(current_id, current_vec);
-        if (!err.ok()) {
-            continue;
-        }
-        
-        // Explore neighbors
+        // Explore neighbors of current node
         const auto& neighbors = graph_index_->get_neighbors(current_id);
         for (NodeId neighbor : neighbors) {
-            if (visited.find(neighbor) == visited.end()) {
-                visited.insert(neighbor);
+            if (neighbor >= num_nodes) continue;  // Skip out-of-range IDs
+            if (!visited.test(neighbor)) {
+                visited.set(neighbor);
                 
-                Distance neighbor_dist = calculate_distance(query, neighbor);
-                
-                candidates.emplace(neighbor, neighbor_dist);
-                
-                if (result_heap.size() < k) {
-                    result_heap.emplace(neighbor, neighbor_dist);
-                } else if (neighbor_dist < result_heap.top().second) {
-                    result_heap.pop();
-                    result_heap.emplace(neighbor, neighbor_dist);
+                // Compute distance: prefer compute_distance_direct (zero-memcpy)
+                // over read_vector + l2_distance (memcpy overhead)
+                float neighbor_dist = -1.0f;
+                if (disk_reader_ && disk_reader_->is_open()) {
+                    neighbor_dist = disk_reader_->compute_distance_direct(neighbor, query);
+                }
+                if (neighbor_dist < 0.0f) {
+                    // Fallback: BufferPool read + SIMD distance
+                    neighbor_dist = static_cast<float>(calculate_distance(query, neighbor));
                 }
                 
-                // Keep candidates queue bounded
-                if (candidates.size() > beam_width) {
-                    // Remove worst candidate
-                    std::vector<Neighbor> temp;
-                    while (!candidates.empty()) {
-                        temp.push_back(candidates.top());
-                        candidates.pop();
-                    }
-                    temp.pop_back();  // Remove worst
-                    for (const auto& n : temp) {
-                        candidates.push(n);
-                    }
+                if (result_heap.size() < ef_search || neighbor_dist < fd) {
+                    candidates.push({neighbor_dist, neighbor});
+                    result_heap.push({neighbor_dist, neighbor});
+                    while (result_heap.size() > ef_search) result_heap.pop();
+                    fd = result_heap.top().first;
                 }
             }
         }
         
-        // Wait for prefetch completions
+        // Wait for prefetch completions (CPU-I/O overlap)
         if (prefetcher_) {
             prefetcher_->wait_prefetch_completions();
         }
     }
     
-    // Extract results
+    // Extract top-K results sorted by distance
+    std::vector<std::pair<float, NodeId>> sorted;
     while (!result_heap.empty()) {
-        results.push_back({result_heap.top().first, result_heap.top().second});
+        sorted.push_back(result_heap.top());
         result_heap.pop();
     }
-    std::reverse(results.begin(), results.end());
+    std::sort(sorted.begin(), sorted.end());
+    
+    results.clear();
+    for (Size i = 0; i < k && i < sorted.size(); ++i) {
+        results.push_back({sorted[i].second, static_cast<Distance>(sorted[i].first)});
+    }
     
     return Error::success();
 }

@@ -24,6 +24,14 @@
 namespace agent_mem_io {
 
 /**
+ * @brief Compute hub threshold from in-degree distribution percentile
+ * @param in_degrees Vector of in-degree values for all nodes
+ * @param percentile Percentile threshold (e.g., 0.75 means top 25% are hubs)
+ * @return In-degree value at the given percentile
+ */
+uint32_t compute_hub_threshold(const std::vector<uint32_t>& in_degrees, double percentile);
+
+/**
  * @brief Buffer pool configuration
  */
 struct BufferPoolConfig {
@@ -48,8 +56,8 @@ struct PageFrame {
     char* data;                        // Page data (aligned buffer)
     bool is_valid;                     // Whether page contains valid data
     bool is_dirty;                     // Whether page has been modified
-    bool is_pinned;                    // Whether page is pinned (cannot be evicted)
-    uint32_t pin_count;                // Number of pins
+    std::atomic<bool> is_pinned;       // Whether page is pinned (atomic for concurrent pin under shared_lock)
+    std::atomic<uint32_t> pin_count;   // Number of pins (atomic for concurrent increment)
     uint64_t access_count;             // Number of accesses
     uint64_t last_access_time;         // Last access timestamp
     uint32_t in_degree;                // Node's in-degree (for graph-aware eviction)
@@ -148,6 +156,24 @@ public:
     void update_in_degree(PageId page_id, uint32_t in_degree);
     
     /**
+     * @brief Update hub threshold based on current in-degree distribution
+     *
+     * Nodes with in_degree >= hub_threshold_ are protected from eviction
+     * (classified as "hub nodes"). The threshold is computed from the
+     * in-degree distribution percentile, adapting dynamically to the
+     * actual graph structure rather than using a fixed cutoff.
+     *
+     * @param in_degrees Current in-degree values for all nodes
+     */
+    void update_hub_threshold(const std::vector<uint32_t>& in_degrees);
+
+    /**
+     * @brief Get current hub threshold value
+     * @return Current hub threshold
+     */
+    uint32_t get_hub_threshold() const;
+
+    /**
      * @brief Clear all queues
      */
     void clear();
@@ -160,7 +186,7 @@ private:
     void promote_to_hot_queue(PageId page_id);
     
     /**
-     * @brief Evict from hot queue using LRU
+     * @brief Evict from hot queue using LRU with dynamic hub protection
      * @return Page ID to evict
      */
     PageId evict_from_hot_queue();
@@ -184,6 +210,12 @@ private:
     
     // In-degree map for graph-aware optimization
     std::unordered_map<PageId, uint32_t> in_degree_map_;
+
+    // Dynamic hub threshold for Graph-Aware eviction
+    // Nodes with in_degree >= hub_threshold_ are protected from eviction
+    // Threshold is computed from the in-degree distribution percentile
+    uint32_t hub_threshold_ = 2;      // Default: protect nodes with >= 2 in-degree
+    double hub_percentile_ = 0.75;    // Top 25% in-degree nodes are hubs
     
     mutable std::mutex mutex_;
 };
@@ -259,6 +291,49 @@ public:
     bool unpin_page(PageId page_id);
     
     /**
+     * @brief Unpin multiple pages in bulk (single lock acquisition)
+     *
+     * More efficient than calling unpin_page() individually for each page,
+     * as it acquires the write lock once for all operations.
+     *
+     * @param pages List of page IDs to unpin
+     */
+    void unpin_all_pages(const std::vector<PageId>& pages);
+    
+    /**
+     * @brief Get a page and pin it atomically (prevent eviction during use)
+     *
+     * Atomically gets a page pointer AND pins it under the same write lock.
+     * This prevents the critical data race where a page could be evicted
+     * between get_page() (shared lock release) and pin_page() (write lock
+     * acquire). Under multi-threaded search, another thread's 2Q eviction
+     * could free the page buffer while SIMD is still reading from it.
+     *
+     * @param node_id Node identifier
+     * @param page_id Page identifier
+     * @return Pointer to page data (pinned), or nullptr if not found
+     */
+    char* get_and_pin_page(NodeId node_id, PageId page_id);
+    
+    /**
+     * @brief Get or load a page and pin it atomically
+     *
+     * Atomically gets-or-loads a page AND pins it under the same write lock.
+     * Handles both cache hits and misses in a single lock acquisition,
+     * preventing the data race described in get_and_pin_page().
+     *
+     * @param node_id Node identifier
+     * @param page_id Page identifier
+     * @param load_func Function to load page from disk
+     * @return Pointer to page data (pinned), or nullptr if buffer pool full
+     */
+    char* get_or_load_and_pin_page(
+        NodeId node_id,
+        PageId page_id,
+        std::function<void(char* buffer, PageId page_id)> load_func
+    );
+    
+    /**
      * @brief Mark page as dirty
      * @param page_id Page identifier
      */
@@ -327,6 +402,17 @@ public:
     void update_in_degree(NodeId node_id, uint32_t in_degree);
     
     /**
+     * @brief Update hub threshold for Graph-Aware 2Q eviction
+     *
+     * Computes a dynamic threshold from the in-degree distribution.
+     * Nodes with in_degree >= threshold are protected from eviction,
+     * ensuring hub nodes (high connectivity) stay cached longer.
+     *
+     * @param in_degrees In-degree distribution from the graph index
+     */
+    void update_hub_threshold(const std::vector<uint32_t>& in_degrees);
+    
+    /**
      * @brief Prefetch pages (async load)
      * @param page_ids List of page IDs to prefetch
      * @param load_func Function to load page from disk
@@ -370,8 +456,8 @@ private:
     
     BufferPoolConfig config_;
     
-    // Page frames
-    std::vector<PageFrame> frames_;
+    // Page frames (unique_ptr because PageFrame has atomic members — non-copyable)
+    std::unique_ptr<PageFrame[]> frames_;
     
     // Page table: page_id -> frame index
     std::unordered_map<PageId, int> page_table_;
